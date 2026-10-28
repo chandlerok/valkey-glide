@@ -6,7 +6,12 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "@jest/globals";
-import { ClientPool, GlideClient, GlideClientConfiguration } from "..";
+import {
+    ClientPool,
+    GlideClient,
+    GlideClientConfiguration,
+    ServiceType,
+} from "..";
 import { ValkeyCluster } from "../../utils/TestUtils.js";
 import {
     getClientConfigurationOption,
@@ -463,6 +468,132 @@ describe("ClientPool", () => {
                 }
             },
             TIMEOUT,
+        );
+
+        it(
+            "does not exceed maxSize when a borrow burst races warmup",
+            async () => {
+                const maxSize = 4;
+                const pool = await ClientPool.create(standaloneConfig, {
+                    maxSize,
+                    minIdle: maxSize,
+                    acquireTimeoutS: 10,
+                });
+
+                // Deliberately no waitForIdle: warmup connects asynchronously and
+                // racing that window is the point. An acquirer arriving before the
+                // warmup connections were counted used to read room below maxSize
+                // and spawn a redundant on-demand client, leaving surplus idle
+                // connections the pool never reclaimed.
+                try {
+                    const errors: Error[] = [];
+                    await Promise.all(
+                        Array.from({ length: 16 }, () =>
+                            (async () => {
+                                for (let i = 0; i < 5; i++) {
+                                    await pool.borrow(async (client) => {
+                                        await (client as GlideClient).ping();
+                                    });
+                                }
+                            })().catch((e: Error) => errors.push(e)),
+                        ),
+                    );
+                    expect(errors).toHaveLength(0);
+
+                    // Quiesce so totalCount is settled, not mid-release.
+                    const deadline = Date.now() + 5000;
+
+                    while (
+                        pool.idleCount !== pool.totalCount &&
+                        Date.now() < deadline
+                    ) {
+                        await new Promise((r) => setTimeout(r, 50));
+                    }
+
+                    expect(pool.totalCount).toBeLessThanOrEqual(maxSize);
+                    expect(pool.idleCount).toBeLessThanOrEqual(maxSize);
+                } finally {
+                    pool.close();
+                }
+            },
+            TIMEOUT,
+        );
+
+        it(
+            "ordinary-client close does not evict pooled clients",
+            async () => {
+                // On Node the collision damages registry-mediated paths: acquire()
+                // resolves the pooled client from the scope registry (pool_build_handle
+                // -> scope::get_parent_client), which an ordinary close with a colliding
+                // id would have removed. So create and close ordinary clients BEFORE and
+                // BETWEEN acquires, and re-resolve each pooled client after a close — not
+                // just drive already-built handles, which never touch the registry. The
+                // deterministic cross-counter guarantee is the Rust unit test
+                // ordinary_and_pooled_ids_share_one_sequence; this is the E2E scenario.
+                const pool = await ClientPool.create(standaloneConfig, {
+                    maxSize: 3,
+                    minIdle: 1,
+                });
+                await waitForIdle(pool, 1);
+
+                // Open and close ordinary clients up front, advancing the ordinary-id
+                // allocator before any pooled id is resolved from the registry.
+                for (let i = 0; i < 5; i++) {
+                    const ordinary =
+                        await GlideClient.createClient(standaloneConfig);
+                    ordinary.close();
+                }
+
+                // Each borrow re-resolves the pooled client through the registry; a
+                // close between borrows must not have evicted it.
+                for (let round = 0; round < 3; round++) {
+                    const client = await pool.acquire();
+                    const key = makeKey(false, `round-${round}`);
+                    await client.set(key, "alive");
+                    expect(await client.get(key)).toBe("alive");
+                    await pool.release(client);
+
+                    const ordinary =
+                        await GlideClient.createClient(standaloneConfig);
+                    ordinary.close();
+                }
+
+                pool.close();
+            },
+            TIMEOUT,
+        );
+    });
+});
+
+describe("Pool credential provider guard", () => {
+    const config = (provider: unknown) =>
+        ({
+            addresses: [{ host: "invalid.example", port: 1 }],
+            credentials: {
+                username: "iam-user",
+                iamConfig: {
+                    clusterName: "cluster",
+                    service: ServiceType.Elasticache,
+                    region: "us-east-1",
+                    credentialProvider: provider,
+                },
+            },
+        }) as unknown as GlideClientConfiguration;
+
+    it("rejects a custom provider before native pool creation", async () => {
+        await expect(
+            ClientPool.create(
+                config(() => ({
+                    accessKeyId: "access",
+                    secretAccessKey: "secret",
+                })),
+            ),
+        ).rejects.toThrow("cannot use a custom IAM credentials provider");
+    });
+
+    it("rejects a malformed provider before native pool creation", async () => {
+        await expect(ClientPool.create(config("invalid"))).rejects.toThrow(
+            "credentialProvider must be a function",
         );
     });
 });

@@ -184,6 +184,8 @@ git clone https://github.com/valkey-io/valkey-glide.git
 cd valkey-glide
 ```
 
+<!-- The build/test/lint commands below are intentionally mirrored in python/AGENTS.md (agent quick-reference). Keep both in sync when they change. -->
+
 ## Build
 
 ---
@@ -274,6 +276,8 @@ pytest -v -k test_iam_authentication
 ```
 
 If any of these environment variables are not set, IAM authentication tests will be skipped.
+
+IAM auth requires TLS, so these tests always run over TLS against the TLS cluster fixture that every local run provisions. No `--tls` flag needed.
 
 **Note:** The credential values shown above (`test_access_key`, etc.) are arbitrary placeholder strings. The AWS SDK uses them to generate an authentication token, but the local test server doesn't validate the token. These tests verify that the IAM authentication flow works correctly (token generation, connection establishment, and token refresh), not that the credentials are valid.
 
@@ -392,7 +396,7 @@ This section explains how the `valkey-glide` (async client) and `valkey-glide-sy
    This includes:
    - ffi
    - glide-core
-   - logger_core
+   - glide-logger
    - glide_shared (Python module)
 
    Vendoring ensures that all dependencies are self-contained within the package at build time, which is required for reproducible builds and compatibility with tools like cibuildwheel.
@@ -406,7 +410,7 @@ This section explains how the `valkey-glide` (async client) and `valkey-glide-sy
 3. **Multiplatform packaging for PyPI**
    To support building wheels for multiple platforms (Linux, macOS, and different Python versions), we use the [`cibuildwheel`](https://github.com/pypa/cibuildwheel) tool.
    This tool installs all required Python versions and runs the build inside isolated Docker containers (e.g., manylinux2014).
-   Because the sync client depends on external Rust code (`glide-core`, `ffi`, `logger_core`), we run `cibuildwheel` from the **project root** and specify `python/glide-sync` as the build target.
+   Because the sync client depends on external Rust code (`glide-core`, `ffi`, `glide-logger`), we run `cibuildwheel` from the **project root** and specify `python/glide-sync` as the build target.
    This allows the tool to copy the full project context into the container.
 
 4. **Local testing**

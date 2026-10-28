@@ -16,6 +16,7 @@ from glide_shared.config import (
     BaseClientConfiguration,
     GlideClientConfiguration,
     GlideClusterClientConfiguration,
+    _is_async_callable,
 )
 from glide_shared.connection_request import _create_sync_connection_request
 from glide_shared.constants import OK, TEncodable, TResult
@@ -25,6 +26,12 @@ from glide_shared.exceptions import (
     RequestError,
     get_request_error_class,
 )
+from glide_shared.ffi_helpers import (
+    _is_credential_provider_executing,
+    create_credential_provider_callback,
+    handle_command_result,
+)
+from glide_shared.opentelemetry import _create_batch_span, _create_command_span
 from glide_shared.protobuf.command_request_pb2 import RequestType
 from glide_shared.routes import (
     AllNodes,
@@ -103,6 +110,9 @@ class BaseClient(CoreCommands):
         self._pubsub_lock = threading.Lock()
         self._pubsub_condition = threading.Condition(self._pubsub_lock)
         self._pubsub_callback_ref = None  # Keep callback alive
+        self._credential_provider_callback_ref = None
+        self._credential_provider_callback_owner = None
+        self._core_client = self._ffi.NULL
         # Lock protecting _core_client and _is_closed for free-threading safety.
         # Under GIL builds this is a no-op (GIL serializes access).
         # Under free-threaded builds this prevents use-after-free on concurrent close.
@@ -128,7 +138,25 @@ class BaseClient(CoreCommands):
 
         return self
 
-    def _create_core_client(self):
+    def _create_core_client(self):  # noqa: C901
+        previous_owner = self._credential_provider_callback_owner
+        if previous_owner is not None:
+            previous_owner.close()
+        self._credential_provider_callback_owner = None
+        self._credential_provider_callback_ref = None
+        credential_provider = None
+        if (
+            self._config.credentials is not None
+            and self._config.credentials.iam_config is not None
+        ):
+            credential_provider = (
+                self._config.credentials.iam_config.credential_provider
+            )
+        if credential_provider is not None and _is_async_callable(credential_provider):
+            raise ConfigurationError(
+                "The sync client does not support async credential providers; use the async client"
+            )
+
         # This check is needed in case a fork happens after the client already closed
         # In that case the registered fork function will kick in even if the
         # client already closed, and recreate it anyway.
@@ -185,42 +213,99 @@ class BaseClient(CoreCommands):
             # Store reference to prevent garbage collection
             self._address_resolver_callback_ref = address_resolver_callback
 
-        client_response_ptr = self._lib.create_client(
-            conn_req_bytes,
-            len(conn_req_bytes),
-            client_type,
-            pubsub_callback,
-            address_resolver_callback,
-            0,  # client_id is not used by the Python client
+        if credential_provider is None:
+            # Preserve the ordinary latest-main creation path exactly.
+            client_response_ptr = self._lib.create_client(
+                conn_req_bytes,
+                len(conn_req_bytes),
+                client_type,
+                pubsub_callback,
+                address_resolver_callback,
+                0,  # client_id is not used by the Python client
+            )
+
+            Logger.log(Level.INFO, "connection info", "new connection established")
+
+            # Handle the connection response
+            if client_response_ptr != self._ffi.NULL:
+                client_response = self._try_ffi_cast(
+                    "ConnectionResponse*", client_response_ptr
+                )
+                if client_response.conn_ptr != self._ffi.NULL:
+                    self._core_client = client_response.conn_ptr
+                else:
+                    error_message = (
+                        self._ffi.string(
+                            client_response.connection_error_message
+                        ).decode(ENCODING)
+                        if client_response.connection_error_message != self._ffi.NULL
+                        else "Unknown error"
+                    )
+                    raise ClosingError(error_message)
+
+                # Free the connection response to avoid memory leaks
+                self._lib.free_connection_response(client_response_ptr)
+
+                # Note: scope prewarm is deferred to first scoped_connection() call
+                # to avoid creating extra connections at client startup (which breaks
+                # lazy connection tests and connection count assertions).
+            else:
+                raise ClosingError("Failed to create client, response pointer is NULL.")
+            return
+
+        credential_callback, credential_owner = create_credential_provider_callback(
+            self._ffi,
+            credential_provider,
+            allow_async=False,
+            provider_owner=self,
         )
+        try:
+            client_response_ptr = self._lib.create_client_with_credential_provider(
+                conn_req_bytes,
+                len(conn_req_bytes),
+                client_type,
+                pubsub_callback,
+                address_resolver_callback,
+                credential_owner.callback_id,
+                credential_callback,
+            )
+        except BaseException:
+            credential_owner.close()
+            raise
 
         Logger.log(Level.INFO, "connection info", "new connection established")
 
-        # Handle the connection response
-        if client_response_ptr != self._ffi.NULL:
-            client_response = self._try_ffi_cast(
-                "ConnectionResponse*", client_response_ptr
-            )
-            if client_response.conn_ptr != self._ffi.NULL:
-                self._core_client = client_response.conn_ptr
-            else:
-                error_message = (
-                    self._ffi.string(client_response.connection_error_message).decode(
-                        ENCODING
-                    )
-                    if client_response.connection_error_message != self._ffi.NULL
-                    else "Unknown error"
-                )
-                raise ClosingError(error_message)
-
-            # Free the connection response to avoid memory leaks
-            self._lib.free_connection_response(client_response_ptr)
-
-            # Note: scope prewarm is deferred to first scoped_connection() call
-            # to avoid creating extra connections at client startup (which breaks
-            # lazy connection tests and connection count assertions).
-        else:
+        if client_response_ptr == self._ffi.NULL:
+            credential_owner.close()
             raise ClosingError("Failed to create client, response pointer is NULL.")
+
+        client_response = self._try_ffi_cast("ConnectionResponse*", client_response_ptr)
+        if client_response.conn_ptr == self._ffi.NULL:
+            error_message = (
+                self._ffi.string(client_response.connection_error_message).decode(
+                    ENCODING
+                )
+                if client_response.connection_error_message != self._ffi.NULL
+                else "Unknown error"
+            )
+            credential_owner.close()
+            self._lib.free_connection_response(client_response_ptr)
+            raise ClosingError(error_message)
+
+        core_client = client_response.conn_ptr
+        self._lib.free_connection_response(client_response_ptr)
+        with self._client_lock:
+            if self._is_closed:
+                adopt_client = False
+            else:
+                self._core_client = core_client
+                self._credential_provider_callback_ref = credential_callback
+                self._credential_provider_callback_owner = credential_owner
+                adopt_client = True
+        if not adopt_client:
+            credential_owner.close()
+            self._lib.close_client(core_client)
+            raise ClosingError("Client was closed during native creation.")
 
     def _create_push_handle_callback(self):
         """Create the FFI pubsub callback function"""
@@ -491,17 +576,19 @@ class BaseClient(CoreCommands):
         if response_buffers is not None:
             self._validate_response_buffers(response_buffers)
 
-        # Create span if OpenTelemetry is configured and sampling indicates we should trace
+        # Sample before reading the caller's context. A sampled command span uses
+        # the active OTel span as its parent when one is available.
         from .opentelemetry import OpenTelemetry
 
         span = 0
         span_name_cstr = None
-        if OpenTelemetry.should_sample():
-            from glide_shared.protobuf.command_request_pb2 import RequestType
-
+        if OpenTelemetry.is_tracing_enabled() and OpenTelemetry.should_sample():
+            parent_ctx = OpenTelemetry._get_parent_span_context()
             command_name = RequestType.Name(request_type)
             span_name_cstr = self._ffi.new("char[]", command_name.encode())
-            span = self._lib.create_named_otel_span(span_name_cstr)
+            span = _create_command_span(
+                self._ffi, self._lib, span_name_cstr, parent_ctx
+            )
 
         try:
             # Convert the arguments to C-compatible pointers
@@ -617,6 +704,19 @@ class BaseClient(CoreCommands):
         )
         return self._handle_cmd_result(result)
 
+    def _refresh_iam_token(self) -> TResult:
+        if self._is_closed:
+            raise ClosingError("Client is closed.")
+        client_adapter_ptr = self._core_client
+        if client_adapter_ptr == self._ffi.NULL:
+            raise ValueError("Invalid client pointer.")
+
+        result = self._lib.refresh_iam_token(
+            client_adapter_ptr,
+            0,  # Request ID (0 for sync use)
+        )
+        return self._handle_cmd_result(result)
+
     def _execute_batch(
         self,
         commands: List[Tuple[RequestType.ValueType, List[TEncodable]]],  # type: ignore[override]
@@ -645,8 +745,9 @@ class BaseClient(CoreCommands):
         from .opentelemetry import OpenTelemetry
 
         span = 0
-        if OpenTelemetry.should_sample():
-            span = self._lib.create_batch_otel_span()
+        if OpenTelemetry.is_tracing_enabled() and OpenTelemetry.should_sample():
+            parent_ctx = OpenTelemetry._get_parent_span_context()
+            span = _create_batch_span(self._ffi, self._lib, parent_ctx)
 
         try:
             # Note: batch_refs and option_refs must remain in scope
@@ -874,8 +975,11 @@ class BaseClient(CoreCommands):
         from .opentelemetry import OpenTelemetry
 
         span = 0
-        if OpenTelemetry.should_sample():
-            span = self._lib.create_named_otel_span(_EVALSHA_SPAN_NAME)
+        if OpenTelemetry.is_tracing_enabled() and OpenTelemetry.should_sample():
+            parent_ctx = OpenTelemetry._get_parent_span_context()
+            span = _create_command_span(
+                self._ffi, self._lib, _EVALSHA_SPAN_NAME, parent_ctx
+            )
 
         try:
             result = self._lib.invoke_script(
@@ -1053,14 +1157,25 @@ class BaseClient(CoreCommands):
         return self._handle_cmd_result(result)
 
     def close(self) -> None:
+        if _is_credential_provider_executing(self):
+            raise RuntimeError(
+                "Cannot close a client from its own credential provider callback"
+            )
         with self._client_lock:
             if not self._is_closed:
                 self._is_closed = True
                 with self._pubsub_condition:
                     self._pubsub_condition.notify_all()
-                self._lib.close_client(self._core_client)
-                self._core_client = self._ffi.NULL
+                core_client = getattr(self, "_core_client", self._ffi.NULL)
+                if core_client != self._ffi.NULL:
+                    self._lib.close_client(core_client)
+                    self._core_client = self._ffi.NULL
                 self._pubsub_callback_ref = None
+                owner = getattr(self, "_credential_provider_callback_owner", None)
+                if owner is not None:
+                    owner.close()
+                self._credential_provider_callback_owner = None
+                self._credential_provider_callback_ref = None
 
     def __enter__(self) -> Self:
         return self
@@ -1094,18 +1209,24 @@ class BaseClient(CoreCommands):
         Args:
             timeout: Maximum seconds to wait for a scope connection (default 5.0).
             routing_key: In cluster mode, the key whose hash slot determines which
-                node the scope connects to. All keys used in the scope must hash to
-                the same slot. If None, defaults to slot 0.
+                node the scope connects to, and against which the scope's first
+                keyed command is validated (a command for a different slot is
+                rejected locally with CROSSSLOT). If None, the scope starts
+                unconstrained (slot 0 selects only the initial connection target):
+                the first keyed command may target any slot and pins the scope to
+                it, after which later keyed commands for a different slot receive
+                CROSSSLOT. In standalone mode this argument is ignored.
 
         Returns:
             An IsolatedScope instance.
 
         Raises:
             TimeoutError: If no scope is available within the timeout.
-            ClosingError: If the client is closed.
+            ConnectionError: If the client is closed while waiting.
+            RequestError: If the client's configuration cannot produce a
+                scoped connection.
+            ClosingError: If the client is already closed.
         """
-        import time
-
         from .isolated_scope import IsolatedScope
 
         if self._is_closed:
@@ -1115,40 +1236,34 @@ class BaseClient(CoreCommands):
         client_id = int(self._ffi.cast("uintptr_t", self._core_client))
         conn_req_bytes = self._conn_req_bytes
 
-        # Compute routing slot from key
-        if routing_key is not None:
-            routing_slot = _slot_for_key(routing_key.encode("utf-8"))
-        else:
-            routing_slot = 0
+        # Compute routing slot from key. Presence is carried separately so a
+        # cluster scope with no routing key stays unconstrained (any primary)
+        # rather than being pinned to slot 0, which is a real slot.
+        has_routing_slot = routing_key is not None
+        routing_slot = (
+            _slot_for_key(routing_key.encode("utf-8")) if routing_key is not None else 0
+        )
 
-        deadline = time.monotonic() + timeout
-        backoff = 0.01  # Start at 10ms (first scope needs ~500ms for TCP connect)
-
-        while True:
-            buf = self._ffi.from_buffer(conn_req_bytes)
-            scope_id = self._lib.glide_scope_try_acquire(
-                client_id,
-                self._ffi.cast("const uint8_t*", buf),
-                len(conn_req_bytes),
-                routing_slot,
-            )
-
-            if scope_id >= 0:
-                return IsolatedScope(
-                    scope_id,
-                    client_id,
-                    _SYNC_FFI,
-                    self._parse_scope_response,
-                )
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "Timed out waiting for isolated scope (pool exhausted)"
-                )
-
-            time.sleep(min(backoff, remaining))
-            backoff = min(backoff * 2, 0.5)  # Cap at 500ms
+        buf = self._ffi.from_buffer(conn_req_bytes)
+        result = self._lib.glide_scope_acquire_blocking(
+            client_id,
+            self._ffi.cast("const uint8_t*", buf),
+            len(conn_req_bytes),
+            has_routing_slot,
+            routing_slot,
+            # uint64_t on the FFI side: a negative value would raise OverflowError
+            # instead of the documented TimeoutError. Negative means no wait.
+            max(0, int(timeout * 1000)),
+        )
+        scope_id = handle_command_result(
+            self._ffi, self._lib, result, lambda resp: resp.int_value
+        )
+        return IsolatedScope(
+            scope_id,
+            client_id,
+            _SYNC_FFI,
+            self._parse_scope_response,
+        )
 
     def _parse_scope_response(self, response_ptr) -> Optional[str]:  # noqa: C901
         """Parse a CommandResponse pointer from a scope execution into a Python string."""

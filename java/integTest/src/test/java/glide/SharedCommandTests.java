@@ -326,6 +326,56 @@ public class SharedCommandTests {
     @SneakyThrows
     @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
+    public void delifeq(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.0.0"), "This feature added in version 9.0.0");
+
+        String key = UUID.randomUUID().toString();
+        String value = String.valueOf(UUID.randomUUID());
+        String wrongValue = String.valueOf(UUID.randomUUID());
+
+        assertFalse(client.delifeq(key, value).get());
+
+        assertEquals(OK, client.set(key, value).get());
+
+        assertFalse(client.delifeq(key, wrongValue).get());
+        assertEquals(value, client.get(key).get());
+
+        assertTrue(client.delifeq(key, value).get());
+        assertNull(client.get(key).get());
+
+        String setKey = UUID.randomUUID().toString();
+        assertEquals(1, client.sadd(setKey, new String[] {"a"}).get());
+        ExecutionException executionException =
+                assertThrows(ExecutionException.class, () -> client.delifeq(setKey, "a").get());
+        assertInstanceOf(RequestException.class, executionException.getCause());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void delifeqBinary(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.0.0"), "This feature added in version 9.0.0");
+
+        GlideString key = gs(UUID.randomUUID().toString());
+        GlideString value = gs(String.valueOf(UUID.randomUUID()));
+        GlideString wrongValue = gs(String.valueOf(UUID.randomUUID()));
+
+        assertFalse(client.delifeq(key, value).get());
+
+        assertEquals(OK, client.set(key, value).get());
+
+        assertFalse(client.delifeq(key, wrongValue).get());
+        assertEquals(value, client.get(key).get());
+
+        assertTrue(client.delifeq(key, value).get());
+        assertNull(client.get(key).get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
     public void del_multiple_keys(BaseClient client) {
         String key1 = "{key}" + UUID.randomUUID();
         String key2 = "{key}" + UUID.randomUUID();
@@ -581,6 +631,58 @@ public class SharedCommandTests {
         client.set(key, ANOTHER_VALUE, options).get();
         String data = client.get(key).get();
         assertEquals(INITIAL_VALUE, data);
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void set_only_if_equal(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("8.1.0"), "This feature added in version 8.1.0");
+
+        String key = UUID.randomUUID().toString();
+        assertEquals(OK, client.set(key, "value").get());
+
+        // Value not equal
+        SetOptions options = SetOptions.builder().conditionalSetOnlyIfEqualTo("other").build();
+        assertNull(client.set(key, "other", options).get());
+        assertEquals("value", client.get(key).get());
+
+        // Value equal
+        options = SetOptions.builder().conditionalSetOnlyIfEqualTo("value").build();
+        assertEquals(OK, client.set(key, "other", options).get());
+        assertEquals("other", client.get(key).get());
+
+        // Non-existent key
+        String missing = UUID.randomUUID().toString();
+        assertNull(client.set(missing, "value", options).get());
+        assertEquals(0L, client.exists(new String[] {missing}).get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void set_only_if_not_equal(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.2.0"), "This feature added in version 9.2.0");
+
+        String key = UUID.randomUUID().toString();
+        assertEquals(OK, client.set(key, "value").get());
+
+        // Value equal
+        SetOptions options = SetOptions.builder().conditionalSetOnlyIfNotEqualTo("value").build();
+        assertNull(client.set(key, "other", options).get());
+        assertEquals("value", client.get(key).get());
+
+        // Value not equal
+        options = SetOptions.builder().conditionalSetOnlyIfNotEqualTo("other").build();
+        assertEquals(OK, client.set(key, "other", options).get());
+        assertEquals("other", client.get(key).get());
+
+        // Non-existent key
+        String missing = UUID.randomUUID().toString();
+        assertEquals(OK, client.set(missing, "value", options).get());
+        assertEquals("value", client.get(missing).get());
     }
 
     @SneakyThrows
@@ -1612,6 +1714,60 @@ public class SharedCommandTests {
     @SneakyThrows
     @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
+    public void hsetex_with_key_conditional_options(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.1.0"),
+                "HSETEX key-level NX/XX condition requires Valkey 9.1.0 or higher");
+
+        String key = "test_hsetex_key_conditional_" + UUID.randomUUID();
+        Map<String, String> fieldValueMap = new LinkedHashMap<>();
+        fieldValueMap.put("field1", "value1");
+
+        // NX: key does not exist yet, so the command should succeed
+        HSetExOptions nxOptions = HSetExOptions.builder().onlyIfKeyDoesNotExist().build();
+        Long result = client.hsetex(key, fieldValueMap, nxOptions).get();
+        assertEquals(1L, result);
+        assertEquals("value1", client.hget(key, "field1").get());
+
+        // NX: key now exists, so a second NX call should fail (return 0) and not modify the hash
+        Map<String, String> otherFieldValueMap = new LinkedHashMap<>();
+        otherFieldValueMap.put("field1", "should_not_be_set");
+        result = client.hsetex(key, otherFieldValueMap, nxOptions).get();
+        assertEquals(0L, result);
+        assertEquals("value1", client.hget(key, "field1").get());
+
+        // XX: key exists, so the command should succeed and update the field
+        HSetExOptions xxOptions = HSetExOptions.builder().onlyIfKeyExists().build();
+        Map<String, String> updateFieldValueMap = new LinkedHashMap<>();
+        updateFieldValueMap.put("field1", "updated_value1");
+        result = client.hsetex(key, updateFieldValueMap, xxOptions).get();
+        assertEquals(1L, result);
+        assertEquals("updated_value1", client.hget(key, "field1").get());
+
+        // XX: key does not exist, so the command should fail (return 0) and not create the hash
+        String missingKey = "test_hsetex_key_conditional_missing_" + UUID.randomUUID();
+        result = client.hsetex(missingKey, fieldValueMap, xxOptions).get();
+        assertEquals(0L, result);
+        assertEquals(0L, client.exists(new String[] {missingKey}).get());
+
+        // Key-level and field-level conditions can be combined, together with expiry
+        String combinedKey = "test_hsetex_key_and_field_conditional_" + UUID.randomUUID();
+        HSetExOptions combinedOptions =
+                HSetExOptions.builder()
+                        .onlyIfKeyDoesNotExist()
+                        .onlyIfNoneExist()
+                        .expiry(ExpirySet.Seconds(60L))
+                        .build();
+        result = client.hsetex(combinedKey, fieldValueMap, combinedOptions).get();
+        assertEquals(1L, result);
+        Long[] ttlResult = client.httl(combinedKey, new String[] {"field1"}).get();
+        assertEquals(1, ttlResult.length);
+        assertTrue(ttlResult[0] > 0 && ttlResult[0] <= 60);
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
     public void hsetex_with_different_expiry_types(BaseClient client) {
         assumeTrue(
                 SERVER_VERSION.isGreaterThanOrEqualTo("9.0.0"),
@@ -1813,6 +1969,111 @@ public class SharedCommandTests {
 
         // Clean up
         client.del(new GlideString[] {key}).get();
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void hgetdel_basic_functionality(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.1.0"),
+                "HGETDEL command requires Valkey 9.1.0 or higher");
+
+        String key = "test_hgetdel_basic_" + UUID.randomUUID();
+
+        Map<String, String> fieldValueMap = new LinkedHashMap<>();
+        fieldValueMap.put("field1", "value1");
+        fieldValueMap.put("field2", "value2");
+        fieldValueMap.put("field3", "value3");
+        client.hset(key, fieldValueMap).get();
+
+        // Get and delete field1 and a nonexistent field
+        String[] fields = {"field1", "nonexistent"};
+        String[] result = client.hgetdel(key, fields).get();
+
+        assertEquals(2, result.length);
+        assertEquals("value1", result[0]);
+        assertNull(result[1]); // nonexistent field returns null
+
+        // field1 should now be deleted; field2 and field3 remain
+        assertNull(client.hget(key, "field1").get());
+        assertEquals("value2", client.hget(key, "field2").get());
+        assertEquals("value3", client.hget(key, "field3").get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void hgetdel_deletes_key_when_last_field_removed(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.1.0"),
+                "HGETDEL command requires Valkey 9.1.0 or higher");
+
+        String key = "test_hgetdel_lastfield_" + UUID.randomUUID();
+
+        Map<String, String> fieldValueMap = new LinkedHashMap<>();
+        fieldValueMap.put("field1", "value1");
+        client.hset(key, fieldValueMap).get();
+
+        String[] result = client.hgetdel(key, new String[] {"field1"}).get();
+        assertEquals(1, result.length);
+        assertEquals("value1", result[0]);
+
+        // The key is deleted automatically when its last field is removed
+        assertEquals(0L, client.exists(new String[] {key}).get());
+
+        // HGETDEL on a nonexistent key returns an array of nulls
+        String[] missing = client.hgetdel(key, new String[] {"field1", "field2"}).get();
+        assertEquals(2, missing.length);
+        assertNull(missing[0]);
+        assertNull(missing[1]);
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void hgetdel_binary_parameters(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.1.0"),
+                "HGETDEL command requires Valkey 9.1.0 or higher");
+
+        GlideString key = gs("test_hgetdel_binary_" + UUID.randomUUID());
+
+        Map<GlideString, GlideString> fieldValueMap = new LinkedHashMap<>();
+        fieldValueMap.put(gs("field1"), gs("value1"));
+        fieldValueMap.put(gs("field2"), gs("value2"));
+        client.hset(key, fieldValueMap).get();
+
+        GlideString[] fields = {gs("field1"), gs("field2")};
+        GlideString[] result = client.hgetdel(key, fields).get();
+
+        assertEquals(2, result.length);
+        assertEquals(gs("value1"), result[0]);
+        assertEquals(gs("value2"), result[1]);
+
+        // Both fields removed -> key deleted
+        assertEquals(0L, client.exists(new GlideString[] {key}).get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void hgetdel_error_handling(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.1.0"),
+                "HGETDEL command requires Valkey 9.1.0 or higher");
+
+        String key = "test_hgetdel_error_" + UUID.randomUUID();
+
+        // Set up a non-hash key to test type error
+        client.set(key, "not_a_hash").get();
+
+        // Should throw an exception when trying to use HGETDEL on a non-hash key
+        ExecutionException exception =
+                assertThrows(
+                        ExecutionException.class, () -> client.hgetdel(key, new String[] {"field1"}).get());
+
+        assertInstanceOf(RequestException.class, exception.getCause());
     }
 
     @SneakyThrows
@@ -4550,6 +4811,36 @@ public class SharedCommandTests {
         ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> client.sismember(key2, member).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void sismemberIfExists(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.2.0"), "This feature added in version 9.2.0");
+        String key = UUID.randomUUID().toString();
+        String member = UUID.randomUUID().toString();
+
+        assertEquals(1, client.sadd(key, new String[] {member}).get());
+        assertEquals(1L, client.sismemberIfExists(key, member).get());
+        assertEquals(0L, client.sismemberIfExists(key, UUID.randomUUID().toString()).get());
+        assertEquals(-1L, client.sismemberIfExists(UUID.randomUUID().toString(), member).get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void sismemberIfExists_binary(BaseClient client) {
+        assumeTrue(
+                SERVER_VERSION.isGreaterThanOrEqualTo("9.2.0"), "This feature added in version 9.2.0");
+        GlideString key = gs(UUID.randomUUID().toString());
+        GlideString member = gs(UUID.randomUUID().toString());
+
+        assertEquals(1, client.sadd(key, new GlideString[] {member}).get());
+        assertEquals(1L, client.sismemberIfExists(key, member).get());
+        assertEquals(0L, client.sismemberIfExists(key, gs(UUID.randomUUID().toString())).get());
+        assertEquals(-1L, client.sismemberIfExists(gs(UUID.randomUUID().toString()), member).get());
     }
 
     @SneakyThrows
@@ -12041,11 +12332,10 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void objectEncoding_returns_string_raw(BaseClient client) {
         String stringRawKey = UUID.randomUUID().toString();
-        assertEquals(
-                OK,
-                client
-                        .set(stringRawKey, "a really loooooooooooooooooooooooooooooooooooooooong value")
-                        .get());
+        // Valkey 9.1 raised the embstr size limit (from 64 to 128 bytes), so a value must exceed
+        // 128 bytes to be stored as "raw" across all supported server versions.
+        String rawValue = Java8Utils.repeat("a", 200);
+        assertEquals(OK, client.set(stringRawKey, rawValue).get());
         assertEquals("raw", client.objectEncoding(stringRawKey).get());
     }
 
@@ -12054,11 +12344,10 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void objectEncoding_binary_returns_string_raw(BaseClient client) {
         GlideString stringRawKey = gs(UUID.randomUUID().toString());
-        assertEquals(
-                OK,
-                client
-                        .set(stringRawKey, gs("a really loooooooooooooooooooooooooooooooooooooooong value"))
-                        .get());
+        // Valkey 9.1 raised the embstr size limit (from 64 to 128 bytes), so a value must exceed
+        // 128 bytes to be stored as "raw" across all supported server versions.
+        GlideString rawValue = gs(Java8Utils.repeat("a", 200));
+        assertEquals(OK, client.set(stringRawKey, rawValue).get());
         assertEquals("raw", client.objectEncoding(stringRawKey).get());
     }
 
@@ -12197,7 +12486,9 @@ public class SharedCommandTests {
         for (Integer i = 0; i <= 128; i++) {
             assertEquals(1, client.zadd(zsetSkiplistKey, createMap(i.toString(), 2d)).get());
         }
-        assertEquals("skiplist", client.objectEncoding(zsetSkiplistKey).get());
+        assertEquals(
+                SERVER_VERSION.isLowerThan("9.2.0") ? "skiplist" : "btree",
+                client.objectEncoding(zsetSkiplistKey).get());
     }
 
     @SneakyThrows

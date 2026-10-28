@@ -5,7 +5,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use super::{NodeAddress, TlsMode, validate_effective_lib_name, validate_effective_lib_ver};
+use super::{
+    NodeAddress, TlsMode, validate_effective_lib_name, validate_effective_lib_ver,
+    validate_unix_socket_address,
+};
 use futures::StreamExt;
 use redis::{
     ConnectionAddr, ConnectionInfo, ErrorKind, RedisConnectionInfo, RedisError, RedisResult,
@@ -122,10 +125,21 @@ impl MonitorClient {
             })?;
         }
 
-        let conn_addr = match tls_mode {
-            TlsMode::NoTls => ConnectionAddr::Tcp(address.host.clone(), address.port),
-            _ => ConnectionAddr::TcpTls {
-                host: address.host.clone(),
+        validate_unix_socket_address(address, tls_mode != TlsMode::NoTls).map_err(|message| {
+            RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "Invalid Unix domain socket address",
+                message,
+            ))
+        })?;
+
+        // MonitorClient bypasses `get_connection_info`, so trim the IPv6 host here too.
+        let host = crate::scope::strip_host_brackets(&address.host).to_string();
+        let conn_addr = match (&address.unix_socket_path, tls_mode) {
+            (Some(path), _) => ConnectionAddr::Unix(path.clone()),
+            (None, TlsMode::NoTls) => ConnectionAddr::Tcp(host, address.port),
+            (None, _) => ConnectionAddr::TcpTls {
+                host,
                 port: address.port,
                 insecure: matches!(tls_mode, TlsMode::InsecureTls),
                 tls_params: None,
@@ -165,7 +179,7 @@ impl MonitorClient {
                                 on_line(parsed);
                             } else {
                                 task_diagnostics.discarded_lines.fetch_add(1, Ordering::Relaxed);
-                                logger_core::log_warn(
+                                glide_logger::log_warn(
                                     "MonitorClient",
                                     format!("discarded an unparseable MONITOR line (length={})", line.len()),
                                 );
@@ -173,7 +187,7 @@ impl MonitorClient {
                         }
                         None => {
                             task_diagnostics.stream_ended.store(true, Ordering::Relaxed);
-                            logger_core::log_warn(
+                            glide_logger::log_warn(
                                 "MonitorClient",
                                 "MONITOR stream ended unexpectedly",
                             );
@@ -232,6 +246,7 @@ mod tests {
         let address = NodeAddress {
             host: "127.0.0.1".to_string(),
             port: 1,
+            unix_socket_path: None,
         };
         let redis_connection_info = RedisConnectionInfo {
             lib_name: Some("invalid name".to_string()),
@@ -259,6 +274,7 @@ mod tests {
         let address = NodeAddress {
             host: "127.0.0.1".to_string(),
             port: 1,
+            unix_socket_path: None,
         };
         let redis_connection_info = RedisConnectionInfo {
             lib_ver: Some("invalid version".to_string()),

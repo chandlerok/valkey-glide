@@ -6,10 +6,19 @@ import static org.junit.jupiter.api.Assertions.*;
 import connection_request.ConnectionRequestOuterClass;
 import glide.api.GlideClient;
 import glide.api.GlideClusterClient;
+import glide.api.models.configuration.AddressResolver;
+import glide.api.models.configuration.BackoffStrategy;
 import glide.api.models.configuration.BaseClientConfiguration;
+import glide.api.models.configuration.ClientCircuitBreakerConfiguration;
+import glide.api.models.configuration.CompressionBackend;
+import glide.api.models.configuration.CompressionConfiguration;
 import glide.api.models.configuration.GlideClientConfiguration;
 import glide.api.models.configuration.GlideClusterClientConfiguration;
+import glide.api.models.configuration.GlideCredentialProvider;
+import glide.api.models.configuration.IamAuthConfig;
 import glide.api.models.configuration.ReadFrom;
+import glide.api.models.configuration.ServerCredentials;
+import glide.api.models.configuration.ServiceType;
 import glide.api.models.exceptions.ConfigurationError;
 import glide.api.models.pool.ClientPool;
 import glide.api.models.pool.ClientPoolConfig;
@@ -18,8 +27,10 @@ import java.util.Arrays;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class ConnectionManagerTest {
 
@@ -244,5 +255,268 @@ public class ConnectionManagerTest {
                 ReadFrom.values().length,
                 "A ReadFrom strategy was added: state whether it requires a clientAZ in"
                         + " ReadFrom.requiresClientAz(), then assert it above and update this count");
+    }
+
+    private static byte[] poolBytes(BaseClientConfiguration config) throws Exception {
+        Method serialize =
+                ClientPool.class.getDeclaredMethod(
+                        "serializeConnectionRequest", BaseClientConfiguration.class);
+        serialize.setAccessible(true);
+        return (byte[]) serialize.invoke(null, config);
+    }
+
+    /**
+     * Pins the circuit-breaker config onto the pooled wire. Before the fix {@code
+     * serializeConnectionRequest} never set {@code client_circuit_breaker}, so a pooled client would
+     * never fail fast; this decodes the produced request and asserts every field survives, which
+     * fails on the pre-fix serializer.
+     */
+    @Test
+    void clientPoolSerialization_carriesCircuitBreakerConfig() throws Exception {
+        ClientCircuitBreakerConfiguration cb =
+                ClientCircuitBreakerConfiguration.builder()
+                        .windowSizeMs(2000)
+                        .failureRateThreshold(0.25f)
+                        .minErrors(7)
+                        .openTimeoutMs(3000)
+                        .countTimeouts(true)
+                        .consecutiveSuccesses(4)
+                        .build();
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder().clientCircuitBreakerConfiguration(cb).build();
+
+        ConnectionRequestOuterClass.ConnectionRequest request =
+                ConnectionRequestOuterClass.ConnectionRequest.parseFrom(poolBytes(clientConfig));
+
+        assertTrue(request.hasClientCircuitBreaker(), "pooled client_circuit_breaker present");
+        ConnectionRequestOuterClass.ClientCircuitBreakerConfig wire = request.getClientCircuitBreaker();
+        assertEquals(2000, wire.getWindowSizeMs());
+        assertEquals(0.25f, wire.getFailureRateThreshold());
+        assertEquals(7, wire.getMinErrors());
+        assertEquals(3000, wire.getOpenTimeoutMs());
+        assertTrue(wire.getCountTimeouts());
+        assertEquals(4, wire.getConsecutiveSuccesses());
+    }
+
+    /**
+     * The pool must reject an invalid circuit-breaker config the same way a directly-created client
+     * does, rather than silently emitting an out-of-range value.
+     */
+    @Test
+    void clientPoolSerialization_rejectsInvalidCircuitBreakerConfig() {
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder()
+                        .clientCircuitBreakerConfiguration(
+                                ClientCircuitBreakerConfiguration.builder().failureRateThreshold(1.5f).build())
+                        .build();
+
+        Exception error = assertThrows(Exception.class, () -> poolBytes(clientConfig));
+        // Reflection wraps the IllegalArgumentException in an InvocationTargetException.
+        Throwable cause = error.getCause() != null ? error.getCause() : error;
+        assertTrue(cause instanceof IllegalArgumentException, "cause: " + cause);
+        assertTrue(cause.getMessage().contains("failureRateThreshold"));
+    }
+
+    /** lazyConnect must survive onto the pooled wire; before the fix it was dropped. */
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void clientPoolSerialization_carriesLazyConnect(boolean lazy) throws Exception {
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder().lazyConnect(lazy).build();
+
+        ConnectionRequestOuterClass.ConnectionRequest request =
+                ConnectionRequestOuterClass.ConnectionRequest.parseFrom(poolBytes(clientConfig));
+
+        assertEquals(lazy, request.getLazyConnect(), "pooled lazy_connect");
+    }
+
+    /**
+     * jitterPercent in the reconnect strategy, bounds included, must reach the pooled wire as set,
+     * matching a directly-created client, rather than falling back to the core default of 20.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {0, 20, 100})
+    void clientPoolSerialization_carriesReconnectJitterPercent(int jitter) throws Exception {
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder()
+                        .reconnectStrategy(validBackoff().jitterPercent(jitter).build())
+                        .build();
+
+        ConnectionRequestOuterClass.ConnectionRetryStrategy pooled =
+                ConnectionRequestOuterClass.ConnectionRequest.parseFrom(poolBytes(clientConfig))
+                        .getConnectionRetryStrategy();
+
+        assertTrue(pooled.hasJitterPercent(), "pooled jitter_percent present");
+        assertEquals(jitter, pooled.getJitterPercent(), "pooled jitter_percent");
+        assertEquals(
+                ConnectionManager.buildConnectionRequest(clientConfig).getConnectionRetryStrategy(),
+                pooled,
+                "pooled retry strategy matches direct");
+    }
+
+    /** An all-zero strategy is sent as set, so the client makes 0 growing retries like the others. */
+    @Test
+    void buildConnectionRequest_sendsAllZeroReconnectStrategy() throws Exception {
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder()
+                        .reconnectStrategy(
+                                BackoffStrategy.builder().numOfRetries(0).factor(0).exponentBase(0).build())
+                        .build();
+
+        ConnectionRequestOuterClass.ConnectionRequest request =
+                ConnectionManager.buildConnectionRequest(clientConfig);
+
+        assertTrue(request.hasConnectionRetryStrategy(), "all-zero reconnect strategy is sent");
+        ConnectionRequestOuterClass.ConnectionRetryStrategy strategy =
+                request.getConnectionRetryStrategy();
+        assertEquals(0, strategy.getNumberOfRetries(), "number_of_retries");
+        assertEquals(0, strategy.getFactor(), "factor");
+        assertEquals(0, strategy.getExponentBase(), "exponent_base");
+    }
+
+    private static BackoffStrategy.BackoffStrategyBuilder validBackoff() {
+        return BackoffStrategy.builder().numOfRetries(3).factor(2).exponentBase(2);
+    }
+
+    static Stream<Arguments> outOfRangeReconnectStrategies() {
+        return Stream.of(
+                Arguments.of("numOfRetries", -1, validBackoff().numOfRetries(-1)),
+                Arguments.of("factor", -1, validBackoff().factor(-1)),
+                Arguments.of("exponentBase", -1, validBackoff().exponentBase(-1)),
+                Arguments.of("jitterPercent", -1, validBackoff().jitterPercent(-1)),
+                Arguments.of("jitterPercent", 101, validBackoff().jitterPercent(101)));
+    }
+
+    /**
+     * An out-of-range reconnect value is rejected with a ConfigurationError naming the field, on both
+     * the direct and the pooled path, instead of wrapping to a huge unsigned value or being dropped.
+     */
+    @ParameterizedTest
+    @MethodSource("outOfRangeReconnectStrategies")
+    void buildConnectionRequest_rejectsOutOfRangeReconnectStrategy(
+            String field, int value, BackoffStrategy.BackoffStrategyBuilder strategy) {
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder().reconnectStrategy(strategy.build()).build();
+        int max = "jitterPercent".equals(field) ? 100 : Integer.MAX_VALUE;
+        String expected =
+                "invalid reconnect strategy: " + field + " must be between 0 and " + max + ", got " + value;
+
+        ConfigurationError direct =
+                assertThrows(
+                        ConfigurationError.class, () -> ConnectionManager.buildConnectionRequest(clientConfig));
+        assertEquals(expected, direct.getMessage());
+
+        Exception pooled = assertThrows(Exception.class, () -> poolBytes(clientConfig));
+        // Reflection wraps the ConfigurationError in an InvocationTargetException.
+        Throwable cause = pooled.getCause() != null ? pooled.getCause() : pooled;
+        assertTrue(cause instanceof ConfigurationError, "cause: " + cause);
+        assertEquals(expected, cause.getMessage());
+    }
+
+    /**
+     * Locks in the deduplication fix: pooled serialization now delegates to the one shared {@code
+     * ConnectionManager.buildConnectionRequest}, so a field the old hand-copied pool serializer never
+     * mirrored — here compression — reaches the pooled wire. Fails on the pre-extraction copy, which
+     * omitted the whole compression block. Stand-in for every field the copy dropped (IAM, mTLS,
+     * cluster topology, client-side cache): if the pool ever forks its own serializer again, this
+     * regresses.
+     */
+    @Test
+    void clientPoolSerialization_carriesCompressionConfig() throws Exception {
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder()
+                        .compressionConfiguration(
+                                CompressionConfiguration.builder()
+                                        .enabled(true)
+                                        .backend(CompressionBackend.LZ4)
+                                        .minCompressionSize(128)
+                                        .build())
+                        .build();
+
+        ConnectionRequestOuterClass.ConnectionRequest request =
+                ConnectionRequestOuterClass.ConnectionRequest.parseFrom(poolBytes(clientConfig));
+
+        assertTrue(request.hasCompressionConfig(), "pooled compression_config present");
+        assertTrue(request.getCompressionConfig().getEnabled());
+        assertEquals(
+                ConnectionRequestOuterClass.CompressionBackend.LZ4,
+                request.getCompressionConfig().getBackend());
+        assertEquals(128, request.getCompressionConfig().getMinCompressionSize());
+    }
+
+    @Test
+    void buildConnectionRequest_doesNotSerializeJavaCredentialProviderAsKey() {
+        GlideCredentialProvider provider = () -> null;
+        GlideClientConfiguration clientConfig =
+                GlideClientConfiguration.builder()
+                        .credentials(
+                                ServerCredentials.builder()
+                                        .username("user")
+                                        .iamConfig(
+                                                IamAuthConfig.builder()
+                                                        .clusterName("my-cluster")
+                                                        .service(ServiceType.ELASTICACHE)
+                                                        .region("us-east-1")
+                                                        .credentialsProvider(provider)
+                                                        .build())
+                                        .build())
+                        .build();
+
+        ConnectionRequestOuterClass.ConnectionRequest request =
+                ConnectionManager.buildConnectionRequest(clientConfig);
+
+        assertTrue(request.getAuthenticationInfo().hasIamCredentials());
+        assertFalse(request.hasCredentialProviderKey());
+    }
+
+    /**
+     * A pool cannot forward the per-client IAM credentials-provider callback ({@code glidePoolCreate}
+     * takes only request bytes), so {@code ClientPool.create} must reject it up front rather than let
+     * the core silently fall back to its default AWS credential chain (a different principal). Throws
+     * synchronously, before any native call.
+     */
+    @Test
+    void clientPoolCreate_rejectsCustomIamCredentialsProvider() {
+        GlideCredentialProvider provider = () -> null; // never invoked; the guard throws first
+        ClientPoolConfig poolConfig =
+                ClientPoolConfig.builder()
+                        .clientConfig(
+                                GlideClientConfiguration.builder()
+                                        .credentials(
+                                                ServerCredentials.builder()
+                                                        .username("user")
+                                                        .iamConfig(
+                                                                IamAuthConfig.builder()
+                                                                        .clusterName("my-cluster")
+                                                                        .service(ServiceType.ELASTICACHE)
+                                                                        .region("us-east-1")
+                                                                        .credentialsProvider(provider)
+                                                                        .build())
+                                                        .build())
+                                        .build())
+                        .build();
+
+        IllegalArgumentException error =
+                assertThrows(IllegalArgumentException.class, () -> ClientPool.create(poolConfig));
+        assertTrue(error.getMessage().contains("custom IAM credentials provider"), error.getMessage());
+    }
+
+    /**
+     * A pool cannot forward the per-client address-resolver callback either. The connectivity probe
+     * runs the resolver and can pass, but pooled connections would use the untranslated address and
+     * fail — so {@code ClientPool.create} must reject it up front. Throws synchronously, before any
+     * native call.
+     */
+    @Test
+    void clientPoolCreate_rejectsCustomAddressResolver() {
+        AddressResolver resolver = (host, port) -> null; // never invoked; the guard throws first
+        ClientPoolConfig poolConfig =
+                ClientPoolConfig.builder()
+                        .clientConfig(GlideClientConfiguration.builder().addressResolver(resolver).build())
+                        .build();
+
+        IllegalArgumentException error =
+                assertThrows(IllegalArgumentException.class, () -> ClientPool.create(poolConfig));
+        assertTrue(error.getMessage().contains("custom address resolver"), error.getMessage());
     }
 }

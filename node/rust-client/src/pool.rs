@@ -10,18 +10,21 @@
 
 #![allow(dead_code)]
 
-use dashmap::DashMap;
+use crate::create_handle_for_client;
 use glide_core::client::{Client, ConnectionRequest};
 use glide_core::connection_request::ConnectionRequest as ProtobufConnectionRequest;
 use glide_core::pool::{self, ClientPool, POOL_RUNNING, PoolConfig};
 use glide_core::scope;
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Env, Error, Result, Status};
 use napi_derive::napi;
 use protobuf::Message;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
-use std::time::{Duration, Instant};
+use redis::PushInfo;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -39,62 +42,25 @@ fn get_pool_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// CLIENT-TO-POOL TRACKING (for abandon detection hooks in command dispatch)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-use std::sync::atomic::AtomicU64;
-
-/// Process-global pool ID allocator. Guarantees uniqueness across worker_threads.
-static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Allocate a unique pool ID. Called by TS in the constructor.
-#[napi]
-pub fn pool_allocate_id() -> i64 {
-    NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed) as i64
-}
-
-/// Counter of registered pool clients (for fast-path gate in command dispatch).
-static POOL_CLIENT_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Returns true if any pool clients are currently registered.
-/// Used to skip DashMap lookup on the hot path for non-pool clients.
-pub fn any_pool_clients() -> bool {
-    POOL_CLIENT_COUNT.load(Ordering::Relaxed) > 0
-}
-
-/// Maps client_id → pool_id for all pool-borrowed clients.
-/// Consulted by GlideClientHandle::send_command to refresh activity.
-static CLIENT_POOL_MAP: LazyLock<DashMap<u64, u64>> = LazyLock::new(DashMap::new);
-
-/// Tracks activity timestamps for pool-borrowed clients.
-/// Updated on every command dispatch for registered clients.
-static CLIENT_ACTIVITY: LazyLock<DashMap<u64, Instant>> = LazyLock::new(DashMap::new);
-
-/// Tracks blocking state for pool-borrowed clients.
-/// Set to true while a blocking command is in flight.
-static CLIENT_BLOCKING: LazyLock<DashMap<u64, Arc<AtomicBool>>> = LazyLock::new(DashMap::new);
-
-/// Get the client-to-pool map (for use by command dispatch hooks).
-pub fn get_client_pool_map() -> &'static DashMap<u64, u64> {
-    &CLIENT_POOL_MAP
-}
-
-/// Refresh the activity timestamp for a pool-borrowed client.
-/// Called from send_command/send_batch/invoke_script hooks.
-pub fn refresh_activity(client_id: u64) {
-    if let Some(mut entry) = CLIENT_ACTIVITY.get_mut(&client_id) {
-        *entry.value_mut() = Instant::now();
-    }
-}
 
 /// Mark/unmark a pool-borrowed client as executing a blocking command.
+/// Uses an atomic counter: increment on blocking=true, saturating decrement on blocking=false.
 /// Returns true if the mark was applied (client is registered).
 pub fn mark_blocking(client_id: u64, blocking: bool) -> bool {
-    if let Some(entry) = CLIENT_BLOCKING.get(&client_id) {
-        entry.value().store(blocking, Ordering::Release);
-        // Refresh activity on unmark (so client isn't immediately reclaimable after a long block)
-        if !blocking {
-            refresh_activity(client_id);
+    if let Some(arc) = glide_core::pool::get_blocking_flag(client_id) {
+        if blocking {
+            arc.fetch_add(1, Ordering::Release);
+        } else {
+            // Best-effort activity refresh BEFORE decrementing.
+            let _ = glide_core::pool::try_refresh_activity_by_client(client_id);
+            // Atomic CAS decrement: avoids the TOCTOU window between load and fetch_sub.
+            // If count > 0, decrement atomically; if already 0, do nothing (no underflow).
+            //TODO: (#7175) `fetch_update` is deprecated for `try_update` since Rust 1.99, but `try_update`
+            // needs 1.95 and the MSRV is 1.94.1.
+            #[allow(deprecated)]
+            let _ = arc.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                if v > 0 { Some(v - 1) } else { None }
+            });
         }
         true
     } else {
@@ -102,161 +68,8 @@ pub fn mark_blocking(client_id: u64, blocking: bool) -> bool {
     }
 }
 
-/// Register a client as pool-borrowed. Called by TS on acquire.
-#[napi]
-pub fn pool_register_client(pool_id: i64, client_id: i64) {
-    let cid = client_id as u64;
-    CLIENT_POOL_MAP.insert(cid, pool_id as u64);
-    CLIENT_ACTIVITY.insert(cid, Instant::now());
-    CLIENT_BLOCKING.insert(cid, Arc::new(AtomicBool::new(false)));
-    POOL_CLIENT_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Unregister a client from pool tracking. Called by TS on release/close.
-#[napi]
-pub fn pool_unregister_client(client_id: i64) {
-    let cid = client_id as u64;
-    if CLIENT_POOL_MAP.remove(&cid).is_some() {
-        POOL_CLIENT_COUNT.fetch_sub(1, Ordering::Relaxed);
-    }
-    CLIENT_ACTIVITY.remove(&cid);
-    CLIENT_BLOCKING.remove(&cid);
-    // Drop any pending discard record so it can't be applied to a later borrow
-    DISCARDED_CLIENTS.remove(&cid);
-}
-
-/// Drain discarded client IDs from the abandon monitor.
-/// Returns client IDs that were abandoned and should be closed by TS.
-#[napi]
-pub fn pool_drain_discarded(pool_id: i64) -> Vec<i64> {
-    // The Node abandon monitor stores discarded IDs in DISCARDED_CLIENTS
-    let mut result = vec![];
-    DISCARDED_CLIENTS.retain(|key, &mut pid| {
-        if pid == pool_id as u64 {
-            result.push(*key as i64);
-            false // remove from map
-        } else {
-            true // keep
-        }
-    });
-    result
-}
-
-/// Stores client IDs discarded by the abandon monitor, keyed by client_id → pool_id.
-static DISCARDED_CLIENTS: LazyLock<DashMap<u64, u64>> = LazyLock::new(DashMap::new);
-
-/// Stores monitor abort handles per pool_id.
-static MONITOR_HANDLES: LazyLock<DashMap<u64, tokio::task::JoinHandle<()>>> =
-    LazyLock::new(DashMap::new);
-
-/// Start the abandon monitor for a pool. Called by TS during pool creation.
-/// pool_id is an arbitrary identifier used to group clients.
-/// abandon_timeout_ms of 0 disables the monitor.
-#[napi]
-pub fn pool_start_monitor(pool_id: i64, abandon_timeout_ms: i64) {
-    if abandon_timeout_ms <= 0 {
-        return; // 0 = disabled, negative = invalid
-    }
-    start_node_abandon_monitor(
-        pool_id as u64,
-        Duration::from_millis(abandon_timeout_ms as u64),
-    );
-}
-
-/// Stop and abort the abandon monitor for a pool. Called by TS on close().
-#[napi]
-pub fn pool_stop_monitor(pool_id: i64) {
-    let pid = pool_id as u64;
-    if let Some((_, handle)) = MONITOR_HANDLES.remove(&pid) {
-        handle.abort();
-    }
-    // Drop any undrained discard records for this pool
-    DISCARDED_CLIENTS.retain(|_, owner| *owner != pid);
-}
-
-/// Start the Node-specific abandon monitor for a pool.
-/// Scans CLIENT_ACTIVITY for clients that exceeded abandon_timeout.
-fn start_node_abandon_monitor(pool_id: u64, abandon_timeout: Duration) {
-    if abandon_timeout.is_zero() {
-        return;
-    }
-
-    let scan_interval = std::cmp::max(abandon_timeout / 2, Duration::from_secs(1));
-
-    let handle = get_pool_runtime().spawn(async move {
-        loop {
-            tokio::time::sleep(scan_interval).await;
-
-            // Collect abandoned client IDs
-            let now = Instant::now();
-            let mut abandoned = vec![];
-
-            for entry in CLIENT_POOL_MAP.iter() {
-                let client_id = *entry.key();
-                let pid = *entry.value();
-
-                if pid != pool_id {
-                    continue;
-                }
-
-                // Skip blocking clients
-                if let Some(blocking) = CLIENT_BLOCKING.get(&client_id)
-                    && blocking.value().load(Ordering::Acquire)
-                {
-                    continue;
-                }
-
-                // Check activity
-                if let Some(activity) = CLIENT_ACTIVITY.get(&client_id)
-                    && now.duration_since(*activity.value()) > abandon_timeout
-                {
-                    abandoned.push(client_id);
-                }
-            }
-
-            // Discard abandoned clients
-            for client_id in abandoned {
-                // Revalidate before discarding (TOCTOU mitigation — reduces but does not
-                // eliminate the race window, same pattern as glide-core's monitor)
-                let recheck_now = Instant::now();
-                let should_discard = CLIENT_ACTIVITY
-                    .get(&client_id)
-                    .map(|a| recheck_now.duration_since(*a.value()) > abandon_timeout)
-                    .unwrap_or(false)
-                    && CLIENT_BLOCKING
-                        .get(&client_id)
-                        .map(|b| !b.value().load(Ordering::Acquire))
-                        .unwrap_or(true);
-
-                if should_discard {
-                    // Remove from tracking and mark as discarded
-                    if CLIENT_POOL_MAP.remove(&client_id).is_some() {
-                        POOL_CLIENT_COUNT.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    CLIENT_ACTIVITY.remove(&client_id);
-                    CLIENT_BLOCKING.remove(&client_id);
-                    DISCARDED_CLIENTS.insert(client_id, pool_id);
-                    logger_core::log_warn(
-                        "pool",
-                        format!(
-                            "Abandon detection: client {client_id} exceeded inactivity timeout — discarding"
-                        ),
-                    );
-                }
-            }
-
-            // Do not self-terminate: clients are registered lazily on acquire,
-            // so an empty pool is a normal transient state. The monitor is
-            // aborted by pool_stop_monitor() when the pool closes.
-        }
-    });
-
-    MONITOR_HANDLES.insert(pool_id, handle);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // POOL CONFIG / METRICS
-// TODO: Wire TS pool to these Rust-managed functions, replacing TS-level state duplication.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[napi(object)]
@@ -280,14 +93,146 @@ pub struct PoolMetrics {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POOL LIFECYCLE (synchronous N-API — no runtime needed)
+// POOL LIFECYCLE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[napi]
-pub fn create_pool(
+/// Outcome of the probe warmup dial, as reported to the `create_pool` deferred.
+type WarmupResult = std::result::Result<(), String>;
+
+/// Outcome of one warmup dial.
+enum WarmupOutcome {
+    /// Client was dialed and seated, consuming the caller's reservation.
+    Seated,
+    /// Dial failed; the caller's reservation has been handed back.
+    Failed(String),
+    /// Pool was destroyed or unregistered mid-dial, so nothing was seated.
+    Aborted,
+}
+
+/// Hand back `n` warmup reservations the calling task holds.  No-op if the pool
+/// is already unregistered — the reservations died with the registry entry.
+async fn release_warmup_slots(pool_id: u64, n: u32) {
+    if n == 0 {
+        return;
+    }
+    if let Some(pool_entry) = pool::get_pool_registry().get(&pool_id) {
+        let mut pool_guard = pool_entry.value().lock().await;
+        for _ in 0..n {
+            pool_guard.release_reservation();
+        }
+    }
+}
+
+/// Dial one warmup connection and seat it in the pool's idle list.
+///
+/// The caller holds exactly one warmup reservation per call: it is consumed by
+/// `add_client_reserved` on success or handed back via [`release_warmup_slots`]
+/// on failure, never both.
+///
+/// `seat_then_discard` is set for the `min_idle == 0` probe: the client is taken
+/// back out of the idle list before this returns, so the caller cannot signal
+/// success while the TS layer could still acquire the probe (TOCTOU race).
+async fn warmup_dial(pool_id: u64, conn_bytes: &[u8], seat_then_discard: bool) -> WarmupOutcome {
+    let connection_request = match ProtobufConnectionRequest::parse_from_bytes(conn_bytes) {
+        Ok(req) => req,
+        Err(e) => {
+            release_warmup_slots(pool_id, 1).await;
+            return WarmupOutcome::Failed(format!(
+                "Failed to parse connection request during warmup: {e}"
+            ));
+        }
+    };
+
+    // Extract address resolver key BEFORE converting to internal request,
+    // because the key field exists only on the protobuf type.
+    let resolver_key = connection_request
+        .address_resolver_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .map(ToString::to_string);
+
+    let mut internal_req: ConnectionRequest = connection_request.into();
+
+    // Pool connections share the resolver — use get() not remove() so
+    // subsequent pool connections (warmup, on-demand, reconnects) also
+    // have the resolver.  The resolver is cleaned up in ClientPool.close()
+    // on the TypeScript side.
+    if let Some(key) = resolver_key
+        && let Some(resolver) = glide_core::address_resolver_registry::get(&key)
+    {
+        internal_req.address_resolver = Some(resolver);
+    }
+
+    // No push sender: pool clients do not support pub/sub.
+    let client: Client = match Client::new(internal_req, None).await {
+        Ok(c) => c,
+        Err(e) => {
+            release_warmup_slots(pool_id, 1).await;
+            return WarmupOutcome::Failed(format!("Pool warmup: failed to create client: {e}"));
+        }
+    };
+
+    // Register the client in the pool's idle list.
+    {
+        let registry = pool::get_pool_registry();
+        match registry.get(&pool_id) {
+            Some(pool_entry) => {
+                let mut pool_guard = pool_entry.value().lock().await;
+                if pool_guard.state.load(Ordering::Acquire) != POOL_RUNNING {
+                    // Pool was destroyed before this dial finished.
+                    drop(pool_guard);
+                    release_warmup_slots(pool_id, 1).await;
+                    return WarmupOutcome::Aborted;
+                }
+                // Slot already reserved — add_client_reserved does not
+                // increment total_count.
+                let cid = pool_guard.add_client_reserved(client.clone());
+                scope::register_client(cid, client);
+                let (_, condvar) = &*pool_guard.release_notify;
+                condvar.notify_all();
+            }
+            None => {
+                // Registry entry gone — the reservation went with it.
+                return WarmupOutcome::Aborted;
+            }
+        }
+    }
+
+    if seat_then_discard {
+        let registry = pool::get_pool_registry();
+        if let Some(pool_entry) = registry.get(&pool_id) {
+            let mut pool_guard = pool_entry.value().lock().await;
+            if let Some(entry) = pool_guard.idle.pop_back() {
+                // discard_client decrements the slot this dial consumed via
+                // add_client_reserved.
+                pool_guard.discard_client(entry.client_id);
+                scope::unregister_client(entry.client_id);
+            }
+        }
+        // Lock released here before the caller signals success.
+    }
+
+    WarmupOutcome::Seated
+}
+
+/// Create a glide-core-managed pool and return a `Promise<pool_id>`.
+///
+/// The warmup creates `min_idle` connections and adds them to the pool's idle
+/// list so that `pool_try_acquire` can hand them out immediately.  The Promise
+/// resolves once the probe connection succeeds (connectivity validation) and
+/// rejects if the probe connection fails; the remaining connections are dialed
+/// in the background and a failure there is non-fatal.
+///
+/// Pool clients are created without a push-message channel because pub/sub is
+/// not supported on pooled connections.
+#[napi(ts_return_type = "Promise<number>")]
+pub fn create_pool<'a>(
+    env: &'a Env,
     connection_request_bytes: Uint8Array,
     pool_config: PoolConfigNapi,
-) -> Result<i64> {
+) -> Result<Object<'a>> {
+    let (deferred, promise) = env.create_deferred()?;
+
     let conn_req_bytes = connection_request_bytes.as_ref().to_vec();
 
     let proto_req = ProtobufConnectionRequest::parse_from_bytes(&conn_req_bytes).map_err(|e| {
@@ -296,6 +241,13 @@ pub fn create_pool(
             format!("Invalid connection request: {e}"),
         )
     })?;
+
+    if proto_req.credential_provider_key.is_some() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "Pool clients cannot use a custom IAM credentials provider. Configure IAM without a credentialProvider to use the default AWS credential chain.",
+        ));
+    }
 
     if proto_req.pubsub_subscriptions.is_some() {
         return Err(Error::new(
@@ -323,56 +275,304 @@ pub fn create_pool(
 
     let pool_id = pool::register_pool(pool) as i64;
 
-    // Start abandon monitor
+    // Start abandon monitor for this pool.
     pool::start_abandon_monitor(pool_id as u64, get_pool_runtime().handle());
 
-    // Background warmup
+    // Background warmup: create min_idle raw Client objects and add to the pool's
+    // idle list.  No GlideClientHandle is built here — handles are built JIT on
+    // acquire via pool_build_handle.  Pool clients are created without a push
+    // channel (pub/sub not supported for pooled connections).
     let min_idle = pool_config.min_idle;
     let conn_bytes = conn_req_bytes;
-    get_pool_runtime().spawn(async move {
-        for _ in 0..min_idle {
-            let connection_request = match ProtobufConnectionRequest::parse_from_bytes(&conn_bytes)
-            {
-                Ok(req) => req,
-                Err(_) => break,
-            };
-            let mut internal_req: ConnectionRequest = connection_request.into();
-            internal_req.address_resolver = None;
 
-            match Client::new(internal_req, None).await {
-                Ok(client) => {
-                    let registry = pool::get_pool_registry();
-                    if let Some(pool_entry) = registry.get(&(pool_id as u64)) {
-                        let mut pool_guard = pool_entry.value().lock().await;
-                        if pool_guard.state.load(Ordering::Acquire) == POOL_RUNNING {
-                            let cid = pool_guard.add_client(client.clone());
-                            scope::register_client(cid, client);
-                            let (_, condvar) = &*pool_guard.release_notify;
-                            condvar.notify_all();
-                        }
-                    }
+    // Oneshot: probe-connection result → deferred resolver.
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<WarmupResult>();
+
+    get_pool_runtime().spawn(async move {
+        // Always probe at least one connection for connectivity validation, even
+        // when min_idle=0.  If the probe succeeds and min_idle=0 was requested,
+        // the extra client is removed from the idle list before success is signalled.
+        let probe_count = if min_idle == 0 { 1 } else { min_idle };
+
+        // Reserve the warmup slots up front so should_create() reads the pool as
+        // full while these connections are still in flight — the pool becomes
+        // acquirable once the probe lands (which resolves the deferred) while the
+        // remaining connections are still being made. See
+        // ClientPool::reserve_warmup_slots.
+        // Each seated connection consumes its reservation via add_client_reserved;
+        // the min_idle=0 probe is seated then removed via discard_client, which
+        // decrements the counted slot exactly once.
+        let reserved = {
+            let registry = pool::get_pool_registry();
+            match registry.get(&(pool_id as u64)) {
+                Some(pool_entry) => {
+                    let pool_guard = pool_entry.value().lock().await;
+                    pool_guard.reserve_warmup_slots(probe_count)
                 }
-                Err(e) => {
-                    logger_core::log_warn("pool", format!("Background warmup failed: {e}"));
+                None => {
+                    let _ = first_tx.send(Err("Pool unregistered before warmup".to_string()));
+                    return;
                 }
+            }
+        };
+
+        if reserved == 0 {
+            // Pool already at max_size, so there is nothing to dial; it is still usable.
+            let _ = first_tx.send(Ok(()));
+            return;
+        }
+
+        // Only the probe gates create_pool, and the remaining dials start only once
+        // the probe has succeeded: a rejected create must never leave a seated
+        // client behind, because the reject path's unregister_pool drops the pool
+        // registry entry without closing clients already in the scope registry —
+        // those would hold their connections open for the process lifetime.
+        match warmup_dial(pool_id as u64, &conn_bytes, min_idle == 0).await {
+            WarmupOutcome::Seated => {}
+            WarmupOutcome::Failed(msg) => {
+                glide_logger::log_warn("pool", msg.clone());
+                // Nothing was spawned for the other slots, so hand them back here.
+                release_warmup_slots(pool_id as u64, reserved - 1).await;
+                let _ = first_tx.send(Err(msg));
+                return;
+            }
+            WarmupOutcome::Aborted => {
+                // Pool destroyed mid-dial.  Leaving the oneshot unreported is
+                // deliberate: the dropped sender rejects the deferred.
+                release_warmup_slots(pool_id as u64, reserved - 1).await;
+                return;
+            }
+        }
+
+        // One task per remaining reserved slot so the dials run concurrently — the
+        // reservation suppresses on-demand creation, so a slow dial must not stall
+        // the slots behind it or borrowers hit acquireTimeoutS below maxSize.  Each
+        // task owns exactly one reservation: it either consumes it via
+        // add_client_reserved or hands it back via release_warmup_slots, never both.
+        // A failure here is non-fatal: the pool is already usable, and rejecting the
+        // create would throw away a probe (and siblings) that connected fine.
+        for _ in 1..reserved {
+            let conn_bytes = conn_bytes.clone();
+            get_pool_runtime().spawn(async move {
+                if let WarmupOutcome::Failed(msg) =
+                    warmup_dial(pool_id as u64, &conn_bytes, false).await
+                {
+                    glide_logger::log_warn("pool", msg);
+                }
+            });
+        }
+
+        let _ = first_tx.send(Ok(()));
+    });
+
+    // Resolve/reject the deferred based on the probe outcome.
+    get_pool_runtime().spawn(async move {
+        match first_rx.await {
+            Ok(Ok(())) => deferred.resolve(move |_| Ok(pool_id)),
+            Ok(Err(msg)) => {
+                // Warmup failed — unregister the pool before rejecting so the
+                // registry doesn't accumulate dead entries.
+                pool::unregister_pool(pool_id as u64);
+                deferred.reject(Error::new(Status::Unknown, msg));
+            }
+            Err(_) => {
+                pool::unregister_pool(pool_id as u64);
+                deferred.reject(Error::new(Status::Unknown, "Pool warmup task dropped"));
             }
         }
     });
 
-    Ok(pool_id)
+    Ok(promise)
+}
+
+/// Build a `GlideClientHandle` for a pool-acquired client identified by `client_id`.
+///
+/// Called by TS after `pool_try_acquire` or `pool_acquire_blocking` returns a
+/// non-negative `client_id`.  Looks up the [`Client`] in the scope registry
+/// and wraps it in a handle with a dedicated worker thread and response buffer.
+///
+/// The `wake_callback` is the JS callback that signals "responses available"
+/// — it should be the `handleResponsesAvailable` bound method of the
+/// `GlideClient` (or `GlideClusterClient`) being constructed.
+///
+/// Pool clients were created without a pub/sub push channel, so the handle's
+/// push listener will simply block forever on an empty channel — this is
+/// correct and harmless.
+#[napi(ts_return_type = "Promise<GlideClientHandle>")]
+pub fn pool_build_handle<'a>(
+    env: &'a Env,
+    client_id: i64,
+    #[napi(ts_arg_type = "() => void")] wake_callback: Function<(), ()>,
+) -> Result<Object<'a>> {
+    let (deferred, promise) = env.create_deferred()?;
+
+    let wake_tsfn: Arc<ThreadsafeFunction<(), (), (), Status, false>> =
+        Arc::new(wake_callback.build_threadsafe_function().build()?);
+
+    let client_id_u64 = client_id as u64;
+
+    get_pool_runtime().spawn(async move {
+        // Retrieve the Client from the scope registry.
+        let client = match scope::get_parent_client(client_id_u64) {
+            Some(c) => c,
+            None => {
+                deferred.reject(Error::new(
+                    Status::InvalidArg,
+                    format!("No client registered for client_id {client_id_u64}"),
+                ));
+                return;
+            }
+        };
+
+        // Resolve the inflight_requests_limit from the pool config stored for
+        // this client.  Falls back to the global default if not found so
+        // pool_build_handle is always safe to call even without pool context.
+        let inflight_requests_limit = if let Some(pool_id) =
+            glide_core::pool::get_pool_id_for_client(client_id_u64)
+        {
+            if let Some(pool_arc) = glide_core::pool::get_pool(pool_id) {
+                let pool_guard = pool_arc.lock().await;
+                let req = ProtobufConnectionRequest::parse_from_bytes(
+                    &pool_guard.config.connection_request,
+                );
+                match req {
+                    Ok(r) if r.inflight_requests_limit > 0 => r.inflight_requests_limit as isize,
+                    _ => glide_core::client::DEFAULT_MAX_INFLIGHT_REQUESTS as isize,
+                }
+            } else {
+                glide_core::client::DEFAULT_MAX_INFLIGHT_REQUESTS as isize
+            }
+        } else {
+            glide_core::client::DEFAULT_MAX_INFLIGHT_REQUESTS as isize
+        };
+
+        // Create a dummy push channel.  Pool clients don't use pub/sub, so
+        // push_receiver will never receive any messages.
+        let (_push_sender, push_receiver) = mpsc::unbounded_channel::<PushInfo>();
+
+        match create_handle_for_client(
+            client,
+            push_receiver,
+            wake_tsfn,
+            inflight_requests_limit,
+            Some(client_id_u64),
+        )
+        .await
+        {
+            Ok(handle) => deferred.resolve(|_| Ok(handle)),
+            Err(e) => deferred.reject(e),
+        }
+    });
+
+    Ok(promise)
+}
+
+/// Create a raw pool client (no push channel, no worker thread) from serialised
+/// protobuf connection-request bytes.  This is the same path as the warmup loop
+/// in `create_pool`, factored out so that `pool_try_acquire` can trigger
+/// on-demand connection creation when the pool is not yet full.
+async fn create_raw_pool_client(conn_bytes: &[u8]) -> std::result::Result<Client, String> {
+    let connection_request =
+        ProtobufConnectionRequest::parse_from_bytes(conn_bytes).map_err(|e| {
+            format!("Failed to parse connection request during on-demand creation: {e}")
+        })?;
+
+    // Extract address resolver key BEFORE converting to internal request,
+    // because the key field exists only on the protobuf type.
+    let resolver_key = connection_request
+        .address_resolver_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .map(ToString::to_string);
+
+    let mut internal_req: ConnectionRequest = connection_request.into();
+
+    // Pool connections share the resolver — use get() not remove() so
+    // subsequent pool connections (warmup, on-demand, reconnects) also
+    // have the resolver.  The resolver is cleaned up in ClientPool.close()
+    // on the TypeScript side.
+    if let Some(key) = resolver_key
+        && let Some(resolver) = glide_core::address_resolver_registry::get(&key)
+    {
+        internal_req.address_resolver = Some(resolver);
+    }
+
+    // No push sender: pool clients do not support pub/sub.
+    Client::new(internal_req, None)
+        .await
+        .map_err(|e| format!("On-demand pool client creation failed: {e}"))
+}
+
+/// Spawn a background task to create a new pool client if `pool_guard.should_create()`.
+/// Pre-increments `total_count` under the caller's lock, then decrements on failure.
+/// Notifies waiters via `release_notify` on success so `pool_acquire_blocking` wakes up.
+fn maybe_spawn_on_demand_creation(
+    pool_entry: Arc<tokio::sync::Mutex<ClientPool>>,
+    pool_guard: &mut ClientPool,
+) {
+    if !pool_guard.should_create() {
+        return;
+    }
+    // Pre-reserve the slot so concurrent callers don't over-create.
+    pool_guard
+        .total_count
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let bytes = pool_guard.config.connection_request.clone();
+    get_pool_runtime().spawn(async move {
+        match create_raw_pool_client(&bytes).await {
+            Ok(client) => {
+                let mut pg = pool_entry.lock().await;
+                if pg.state.load(std::sync::atomic::Ordering::Acquire) != POOL_RUNNING {
+                    pg.release_reservation();
+                    return;
+                }
+                // add_client_reserved: total_count already incremented above.
+                let cid = pg.add_client_reserved(client.clone());
+                scope::register_client(cid, client);
+                let (_, condvar) = &*pg.release_notify;
+                condvar.notify_all();
+            }
+            Err(e) => {
+                glide_logger::log_warn("pool", format!("On-demand pool creation failed: {e}"));
+                let mut pg = pool_entry.lock().await;
+                pg.release_reservation();
+            }
+        }
+    });
 }
 
 #[napi]
 pub fn pool_try_acquire(pool_id: i64) -> Result<i64> {
+    let pool_id_u64 = pool_id as u64;
     let registry = pool::get_pool_registry();
     let pool_entry = registry
-        .get(&(pool_id as u64))
+        .get(&pool_id_u64)
         .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid pool_id"))?;
 
+    let pool_arc = pool_entry.value().clone();
     let result = get_pool_runtime().block_on(async {
-        let mut pool_guard = pool_entry.value().lock().await;
-        pool_guard.try_acquire()
+        let mut pool_guard = pool_arc.lock().await;
+        // Drain discarded IDs first (abandoned clients).
+        let discarded = pool_guard.drain_discarded_ids();
+        for cid in discarded {
+            scope::unregister_client(cid);
+        }
+        let result = pool_guard.try_acquire();
+        // On-demand creation: no idle client but pool is not yet full.
+        // Spawn background task; the new client will appear in the idle list and
+        // the next pool_acquire_blocking poll (or a subsequent pool_try_acquire)
+        // will hand it out.
+        if result < 0 {
+            maybe_spawn_on_demand_creation(pool_entry.value().clone(), &mut pool_guard);
+        }
+        result
     });
+
+    // Register the acquired client in glide-core's CLIENT_TO_POOL map so that
+    // refresh_activity_by_client() works at command dispatch.
+    if result >= 0 {
+        pool::register_pool_client(pool_id_u64, result as u64);
+    }
 
     Ok(result)
 }
@@ -405,19 +605,34 @@ pub fn pool_acquire_blocking<'a>(
 
             let result = {
                 let mut pool_guard = pool_entry.lock().await;
-                pool_guard.try_acquire()
+                // Drain discarded IDs (abandoned clients) on every poll.
+                let discarded = pool_guard.drain_discarded_ids();
+                for cid in discarded {
+                    scope::unregister_client(cid);
+                }
+                let r = pool_guard.try_acquire();
+                // Trigger on-demand creation when pool has capacity but no idle clients.
+                if r < 0 {
+                    maybe_spawn_on_demand_creation(pool_entry.clone(), &mut pool_guard);
+                }
+                r
             };
 
             if result >= 0 {
                 result_value = result;
+                // Register in glide-core's CLIENT_TO_POOL for activity refresh at dispatch.
+                pool::register_pool_client(pool_id_u64, result as u64);
                 break;
             }
             if result == -1 {
+                // -1 from try_acquire means pool is closed/closing; map to -2 (destroyed)
+                // so the TypeScript caller can distinguish "closed" from "timed out".
                 result_value = -2;
                 break;
             }
 
             if tokio::time::Instant::now() >= deadline {
+                // Timed out waiting for an idle slot; map to -1 (exhausted/timeout).
                 result_value = -1;
                 break;
             }
@@ -474,86 +689,68 @@ pub fn pool_destroy(pool_id: i64) {
     if let Some(pool_arc) = pool::unregister_pool(pool_id as u64) {
         get_pool_runtime().block_on(async {
             let mut pool_guard = pool_arc.lock().await;
+            // Remove each client from the scope client registry. unregister_blocking_flag and
+            // unregister_pool_client are intentionally omitted here: ClientPool::destroy() already
+            // handles those as a defensive fallback for idle and in_use entries.
+            // scope::unregister_client is NOT called by destroy(), so we must do it ourselves.
+            for entry in pool_guard.idle.iter() {
+                scope::unregister_client(entry.client_id);
+            }
+            for entry in pool_guard.in_use.iter() {
+                scope::unregister_client(*entry.key());
+            }
+            // discard_client() already unregistered the core registries for these ids;
+            // only the scope entry is ours.
+            let discarded = pool_guard.drain_discarded_ids();
+            for cid in discarded {
+                scope::unregister_client(cid);
+            }
             pool_guard.destroy();
         });
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POOL COMMAND EXECUTION — deferred Promise pattern
+// SCOPE FUNCTIONS — deferred Promise pattern
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute a command on a pool client. Returns `Promise<string | null>`.
-#[napi(ts_return_type = "Promise<string | null>")]
-pub fn pool_execute_command<'a>(
+/// Acquire a scope from the client's scope pool. Returns `Promise<number>` resolving
+/// to the scope id. The rejection message is prefixed with the `RequestErrorType`
+/// name from `ScopeAcquireError::request_error_type` followed by `: `, so the
+/// binding can pick its error class; napi offers no custom `code` field for that.
+#[napi(ts_return_type = "Promise<number>")]
+pub fn scope_acquire<'a>(
     env: &'a Env,
     client_id: i64,
-    cmd_bytes: Uint8Array,
+    connection_request_bytes: Uint8Array,
+    has_routing_slot: bool,
+    routing_slot: u16,
+    timeout_ms: u32,
 ) -> Result<Object<'a>> {
     let (deferred, promise) = env.create_deferred()?;
-    let cmd_data = cmd_bytes.as_ref().to_vec();
-    let client_id_u64 = client_id as u64;
+    let conn_bytes = connection_request_bytes.as_ref().to_vec();
+    let runtime = get_pool_runtime();
+    let handle = runtime.handle().clone();
 
-    get_pool_runtime().spawn(async move {
-        let parsed = scope::deserialize_command(&cmd_data);
-        let (cmd_name, args) = match parsed {
-            Some(p) => p,
-            None => {
-                deferred.reject(Error::new(
-                    Status::InvalidArg,
-                    "Invalid command wire format",
-                ));
-                return;
-            }
-        };
-
-        let client_registry = scope::get_client_registry();
-        let mut client = match client_registry.get_mut(&client_id_u64) {
-            Some(c) => c,
-            None => {
-                deferred.reject(Error::new(
-                    Status::InvalidArg,
-                    format!("No client registered for client_id {client_id_u64}"),
-                ));
-                return;
-            }
-        };
-
-        let mut cmd = redis::Cmd::new();
-        cmd.arg(cmd_name.as_bytes());
-        for arg in &args {
-            cmd.arg(arg.as_slice());
-        }
-
-        match client.send_command(&mut cmd, None).await {
-            Ok(value) => {
-                let result = value_to_string(value);
-                deferred.resolve(|_| Ok(result));
-            }
-            Err(e) => {
-                deferred.reject(Error::new(Status::GenericFailure, format!("{e}")));
+    runtime.spawn(async move {
+        let result = scope::acquire_scope_with_watchdog(
+            client_id as u64,
+            conn_bytes,
+            &handle,
+            has_routing_slot.then_some(routing_slot),
+            std::time::Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .await;
+        match result {
+            Ok(scope_id) => deferred.resolve(move |_| Ok(scope_id as i64)),
+            Err(err) => {
+                let code = format!("{:?}", err.request_error_type());
+                deferred.reject(Error::new(Status::GenericFailure, format!("{code}: {err}")));
             }
         }
     });
 
     Ok(promise)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SCOPE FUNCTIONS — deferred Promise pattern
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[napi]
-pub fn scope_try_acquire(
-    client_id: i64,
-    connection_request_bytes: Uint8Array,
-    routing_slot: u16,
-) -> Result<i64> {
-    let conn_bytes = connection_request_bytes.as_ref().to_vec();
-    let runtime = get_pool_runtime();
-    let result =
-        scope::try_acquire_scope(client_id as u64, conn_bytes, runtime.handle(), routing_slot);
-    Ok(result)
 }
 
 /// Execute a command on a scoped connection. Returns `Promise<string | null>`.

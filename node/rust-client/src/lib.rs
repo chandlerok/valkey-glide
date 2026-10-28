@@ -12,12 +12,12 @@ use glide_core::{
     DEFAULT_FLUSH_SIGNAL_INTERVAL_MS, GlideOpenTelemetry, GlideOpenTelemetryConfigBuilder,
     GlideOpenTelemetrySignalsExporter, GlideSpan, Telemetry,
 };
-use logger_core::{log_warn, log_warn_lazy};
+use glide_logger::{log_warn, log_warn_lazy};
+use glide_telemetry::GlideSpanStatus;
 use redis::cluster_routing::Routable;
 use redis::{
     Arg, ClusterScanArgs, Cmd, ErrorKind, PipelineRetryStrategy, PushInfo, RedisError, ScanStateRC,
 };
-use telemetrylib::GlideSpanStatus;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -59,7 +59,7 @@ use std::collections::HashMap;
 use std::collections::HashMap as StdHashMap;
 use std::ptr::from_mut;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 use tokio::task;
@@ -251,9 +251,6 @@ struct WorkerPoolState {
 
 static WORKER_POOL_STATE: OnceLock<PLMutex2<WorkerPoolState>> = OnceLock::new();
 
-/// Global counter for unique client IDs (used for scope registry).
-static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
-
 fn get_worker_pool_state() -> &'static PLMutex2<WorkerPoolState> {
     WORKER_POOL_STATE.get_or_init(|| {
         PLMutex2::new(WorkerPoolState {
@@ -286,6 +283,34 @@ fn release_worker_pool() {
             // Drop the pool - this drops all LocalPoolHandle clones held by the state,
             // which closes the channels to worker threads, causing them to exit.
             state.pool = None;
+        }
+    }
+}
+
+/// RAII guard that clears the pool blocking flag when dropped.
+/// Ensures the flag is always unset on every exit path from a `spawn_local` task,
+/// including early returns, panics, and task cancellation.
+/// Also refreshes activity before decrementing so the abandon monitor never observes
+/// counter=0 with a stale `borrowed_at` timestamp.
+struct UnmarkOnDrop(
+    Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    Option<u64>,
+);
+impl Drop for UnmarkOnDrop {
+    fn drop(&mut self) {
+        if let Some(arc) = self.0.take() {
+            // Refresh activity BEFORE decrementing so the monitor sees current
+            // borrowed_at even if it observes counter=0 momentarily.
+            if let Some(client_id) = self.1 {
+                glide_core::pool::refresh_activity_by_client(client_id);
+            }
+            // Saturating decrement via CAS to avoid TOCTOU between load and fetch_sub.
+            //TODO: (#7175) `fetch_update` is deprecated for `try_update` since Rust 1.99, but `try_update`
+            // needs 1.95 and the MSRV is 1.94.1.
+            #[allow(deprecated)]
+            let _ = arc.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                if v > 0 { Some(v - 1) } else { None }
+            });
         }
     }
 }
@@ -506,37 +531,34 @@ fn process_command_for_compression(
     let command_name = &all_args[0];
     let command_str = String::from_utf8_lossy(command_name).to_uppercase();
     let request_type = match command_str.as_str() {
-        "SET" => RequestType::Set,
-        "MSET" => RequestType::MSet,
-        "MSETNX" => RequestType::MSetNX,
-        "SETEX" => RequestType::SetEx,
-        "PSETEX" => RequestType::PSetEx,
-        "SETNX" => RequestType::SetNX,
         "APPEND" => RequestType::Append,
-        "GETRANGE" => RequestType::GetRange,
-        "SETRANGE" => RequestType::SetRange,
-        "STRLEN" => RequestType::Strlen,
-        "LCS" => RequestType::LCS,
-        "SUBSTR" => RequestType::Substr,
-        "INCR" => RequestType::Incr,
-        "INCRBY" => RequestType::IncrBy,
-        "INCRBYFLOAT" => RequestType::IncrByFloat,
-        "DECR" => RequestType::Decr,
-        "DECRBY" => RequestType::DecrBy,
-        "GETBIT" => RequestType::GetBit,
-        "SETBIT" => RequestType::SetBit,
         "BITCOUNT" => RequestType::BitCount,
-        "BITPOS" => RequestType::BitPos,
         "BITFIELD" => RequestType::BitField,
         "BITFIELD_RO" => RequestType::BitFieldReadOnly,
         "BITOP" => RequestType::BitOp,
+        "BITPOS" => RequestType::BitPos,
+        "DECR" => RequestType::Decr,
+        "DECRBY" => RequestType::DecrBy,
+        "DELIFEQ" => RequestType::DelIfEq,
+        "GETBIT" => RequestType::GetBit,
+        "GETRANGE" => RequestType::GetRange,
+        "GETSET" => RequestType::GetSet,
+        "INCR" => RequestType::Incr,
+        "INCRBY" => RequestType::IncrBy,
+        "INCRBYFLOAT" => RequestType::IncrByFloat,
+        "LCS" => RequestType::LCS,
+        "MSET" => RequestType::MSet,
+        "MSETNX" => RequestType::MSetNX,
+        "PSETEX" => RequestType::PSetEx,
+        "SET" => RequestType::Set,
+        "SETBIT" => RequestType::SetBit,
+        "SETEX" => RequestType::SetEx,
+        "SETNX" => RequestType::SetNX,
+        "SETRANGE" => RequestType::SetRange,
+        "STRLEN" => RequestType::Strlen,
+        "SUBSTR" => RequestType::Substr,
         _ => return Ok(()),
     };
-
-    glide_core::compression::validate_command_compression_compatibility(
-        request_type,
-        compression_manager_ref,
-    )?;
 
     let mut args: Vec<Vec<u8>> = all_args[1..].to_vec();
     process_command_args_for_compression(&mut args, request_type, compression_manager_ref)?;
@@ -751,6 +773,170 @@ async fn execute_batch(
 // Direct NAPI Layer - GlideClientHandle
 // ============================================================================
 
+#[cfg(feature = "testing_utilities")]
+static FAIL_PROVIDER_DIRECT_RESOLUTION_AFTER_CONVERSION: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "testing_utilities")]
+static PROVIDER_DIRECT_CLEANUP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "testing_utilities")]
+static PROVIDER_DIRECT_OPEN_HANDLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+const PROVIDER_CLEANUP_OPEN: u8 = 0;
+const PROVIDER_CLEANUP_CLOSING: u8 = 1;
+const PROVIDER_CLEANUP_CLOSED: u8 = 2;
+
+/// Provider-only scope ownership shared by the native handle. `unregister`
+/// returns only after the winning caller has completed all cleanup side effects.
+struct ProviderDirectClientCleanup {
+    client_id: u64,
+    state: AtomicU8,
+    #[cfg(test)]
+    cleanup_count: AtomicU64,
+    #[cfg(test)]
+    synchronization: Option<Arc<ProviderCleanupTestSynchronization>>,
+}
+
+#[cfg(test)]
+struct ProviderCleanupTestSynchronization {
+    winner_claimed: std::sync::mpsc::SyncSender<()>,
+    release_winner: Mutex<std::sync::mpsc::Receiver<bool>>,
+    loser_observed_closing: std::sync::mpsc::SyncSender<()>,
+    pause_next_winner: AtomicBool,
+    signal_next_loser: AtomicBool,
+}
+
+/// Owns the `Open` to `Closing` transition. If cleanup unwinds, dropping this
+/// guard restores `Open` so a waiter or a later close/finalizer can retry.
+struct ProviderCleanupTransition<'a> {
+    cleanup: &'a ProviderDirectClientCleanup,
+    completed: bool,
+}
+
+impl ProviderCleanupTransition<'_> {
+    fn complete(mut self) {
+        self.cleanup
+            .state
+            .store(PROVIDER_CLEANUP_CLOSED, Ordering::Release);
+        self.completed = true;
+    }
+}
+
+impl Drop for ProviderCleanupTransition<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cleanup
+                .state
+                .store(PROVIDER_CLEANUP_OPEN, Ordering::Release);
+        }
+    }
+}
+
+impl ProviderDirectClientCleanup {
+    fn new(client_id: u64) -> Self {
+        Self {
+            client_id,
+            state: AtomicU8::new(PROVIDER_CLEANUP_OPEN),
+            #[cfg(test)]
+            cleanup_count: AtomicU64::new(0),
+            #[cfg(test)]
+            synchronization: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_synchronized(
+        client_id: u64,
+        synchronization: Arc<ProviderCleanupTestSynchronization>,
+    ) -> Self {
+        Self {
+            synchronization: Some(synchronization),
+            ..Self::new(client_id)
+        }
+    }
+
+    fn unregister(&self) {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                PROVIDER_CLEANUP_OPEN => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            PROVIDER_CLEANUP_OPEN,
+                            PROVIDER_CLEANUP_CLOSING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    let transition = ProviderCleanupTransition {
+                        cleanup: self,
+                        completed: false,
+                    };
+
+                    #[cfg(test)]
+                    if let Some(synchronization) = &self.synchronization
+                        && synchronization
+                            .pause_next_winner
+                            .swap(false, Ordering::SeqCst)
+                    {
+                        synchronization
+                            .winner_claimed
+                            .send(())
+                            .expect("cleanup test must receive the winner signal");
+                        let panic_after_release = synchronization
+                            .release_winner
+                            .lock()
+                            .expect("cleanup test release lock must not be poisoned")
+                            .recv()
+                            .expect("cleanup test must release the winner");
+                        if panic_after_release {
+                            panic!("injected provider cleanup panic");
+                        }
+                    }
+
+                    glide_core::scope::unregister_client(self.client_id);
+                    #[cfg(test)]
+                    self.cleanup_count.fetch_add(1, Ordering::SeqCst);
+                    #[cfg(feature = "testing_utilities")]
+                    PROVIDER_DIRECT_CLEANUP_COUNT.fetch_add(1, Ordering::SeqCst);
+
+                    // Publish Closed only after every unregister/counter side effect.
+                    transition.complete();
+                    return;
+                }
+                PROVIDER_CLEANUP_CLOSING => {
+                    #[cfg(test)]
+                    if let Some(synchronization) = &self.synchronization
+                        && synchronization
+                            .signal_next_loser
+                            .swap(false, Ordering::SeqCst)
+                    {
+                        synchronization
+                            .loser_observed_closing
+                            .send(())
+                            .expect("cleanup test must receive the loser signal");
+                    }
+                    while self.state.load(Ordering::Acquire) == PROVIDER_CLEANUP_CLOSING {
+                        std::thread::yield_now();
+                    }
+                    // Closed means the winner completed; Open means it unwound.
+                    // Re-read in either case so an unwound cleanup is retried.
+                    continue;
+                }
+                PROVIDER_CLEANUP_CLOSED => return,
+                state => unreachable!("invalid provider cleanup state {state}"),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn cleanup_count(&self) -> u64 {
+        self.cleanup_count.load(Ordering::SeqCst)
+    }
+}
+
 /// A handle to a Glide client that allows sending commands directly via NAPI.
 /// The client is pinned to a dedicated worker thread for thread-local command execution.
 /// Commands are sent via channel to the worker thread which executes them via spawn_local.
@@ -772,8 +958,516 @@ pub struct GlideClientHandle {
     /// Wrapped in Option to allow explicit drop during close(), which allows Node.js to exit.
     wake_callback: Option<Arc<ThreadsafeFunction<(), (), (), Status, false>>>,
     /// Unique client ID registered in the glide-core scope registry.
-    /// Used for scope operations (try_acquire, execute, release).
     client_id: u64,
+    /// Present only for provider-backed direct clients. It covers the gap where
+    /// handle conversion succeeds but Promise settlement/finalization fails.
+    provider_cleanup: Option<Arc<ProviderDirectClientCleanup>>,
+    /// Makes the complete native close routine idempotent, including finalization.
+    closed: bool,
+    /// Test-only accounting remains open until every native handle field is closed.
+    #[cfg(feature = "testing_utilities")]
+    provider_handle_open: bool,
+}
+
+/// Logs the disconnect warning for a `Disconnection` push and returns `true`,
+/// so the push listeners can drop it instead of queueing it for JS.
+///
+/// Logging here, as the push arrives, means the warning fires even for clients
+/// that never read the push queue (no pub/sub callback, no `getPubSubMessage`).
+fn handle_disconnection_push(push_info: &PushInfo) -> bool {
+    if push_info.kind != redis::PushKind::Disconnection {
+        return false;
+    }
+    log_warn(
+        "disconnect notification",
+        "Transport disconnected, messages might be lost",
+    );
+    true
+}
+
+/// Wrap an already-created [`Client`] in a [`GlideClientHandle`] with a dedicated
+/// pinned worker thread, command channel, and response buffer.
+///
+/// This is the factored-out "step 2" of [`create_direct_client`], reused by the
+/// pool warmup path so that pool-managed connections get the same full N-API
+/// client handle (worker thread + response buffer) as standalone connections.
+///
+/// The function spawns a pinned task on the worker pool and returns a future
+/// that resolves to the handle once the worker has initialised.  Callers must
+/// `.await` the returned future from a context that can drive the oneshot
+/// receive — the pool runtime's `spawn` context works correctly.
+///
+/// `push_receiver` must be the receiving end of the channel that was passed
+/// (as `push_sender`) to [`Client::new`] when `client` was created.
+pub(crate) async fn create_handle_for_client(
+    client: glide_core::client::Client,
+    mut push_receiver: mpsc::UnboundedReceiver<PushInfo>,
+    wake_tsfn: Arc<ThreadsafeFunction<(), (), (), Status, false>>,
+    inflight_requests_limit: isize,
+    provided_client_id: Option<u64>,
+) -> std::result::Result<GlideClientHandle, napi::Error> {
+    // Shared response buffer for this handle.
+    let response_buffer = Arc::new(ResponseBuffer::new());
+    let response_buffer_worker = Arc::clone(&response_buffer);
+
+    // Command channel: JS → worker thread.
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<WorkerMessage>();
+
+    // Weak wake handles for the worker / push listener.
+    let wake_tsfn_worker = Arc::downgrade(&wake_tsfn);
+
+    // Acquire a worker-pool slot (released when the handle's message loop exits).
+    let worker_pool = acquire_worker_pool();
+
+    let response_buffer_push = Arc::clone(&response_buffer);
+    let wake_tsfn_push = Arc::downgrade(&wake_tsfn);
+
+    // Oneshot channel: worker → caller, delivers the constructed GlideClientHandle.
+    let (handle_tx, handle_rx) = tokio::sync::oneshot::channel::<GlideClientHandle>();
+
+    worker_pool.spawn_pinned(move || async move {
+        // Clone command_tx for the handle; drop the original so the channel
+        // closes when the handle is dropped, letting the message loop exit.
+        let command_tx_for_handle = command_tx.clone();
+        drop(command_tx);
+
+        let inflight_counter = Arc::new(AtomicIsize::new(inflight_requests_limit));
+        let client_id = provided_client_id.unwrap_or_else(glide_core::pool::allocate_client_id);
+
+        // Register client in the scope registry.
+        glide_core::scope::register_client(client_id, client.clone());
+
+        let handle = GlideClientHandle {
+            command_tx: Some(command_tx_for_handle),
+            inflight_requests: inflight_counter.clone(),
+            response_buffer: Arc::clone(&response_buffer_worker),
+            wake_callback: Some(Arc::clone(&wake_tsfn)),
+            client_id,
+            provider_cleanup: None,
+            closed: false,
+            #[cfg(feature = "testing_utilities")]
+            provider_handle_open: false,
+        };
+
+        // Store worker-local references to avoid Arc::clone per command.
+        // These are cloned ONCE here and reused for all commands.
+        let worker_inflight = inflight_counter;
+
+        // Spawn a local task to listen for push notifications (pub/sub).
+        // NOTE: push listener is spawned BEFORE sending the handle so that
+        // cluster-mode push notifications cannot arrive in the window between
+        // the caller receiving the handle and the listener being scheduled.
+        task::spawn_local(async move {
+            while let Some(push_info) = push_receiver.recv().await {
+                if handle_disconnection_push(&push_info) {
+                    continue;
+                }
+                let push_value = Value::Push {
+                    kind: push_info.kind,
+                    data: push_info.data,
+                };
+                let value_ptr = from_mut(Box::leak(Box::new(push_value)));
+                let [low, high] = split_pointer(value_ptr);
+                let response = CommandResponse {
+                    callback_idx: 0,
+                    resp_pointer_high: Some(high),
+                    resp_pointer_low: Some(low),
+                    constant_response: None,
+                    request_error: None,
+                    closing_error: None,
+                    is_push: true,
+                };
+                if response_buffer_push.push(response)
+                    && let Some(wake_callback) = wake_tsfn_push.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            }
+        });
+
+        // Send the handle to the awaiting caller; if the receiver has gone away
+        // (caller dropped the future) we continue running the message loop anyway
+        // so that the client is not orphaned.
+        let _ = handle_tx.send(handle);
+
+        // Process messages from the channel.
+        // Each message spawns a local task for concurrent execution within this thread.
+        while let Some(msg) = command_rx.recv().await {
+            run_worker_message(
+                msg,
+                &client,
+                &worker_inflight,
+                &response_buffer_worker,
+                &wake_tsfn_worker,
+            );
+        }
+
+        // Message loop has exited (channel closed by handle.close()).
+        release_worker_pool();
+    });
+
+    handle_rx
+        .await
+        .map_err(|_| napi::Error::new(Status::Unknown, "Worker thread failed to initialise"))
+}
+
+/// Dispatch a single [`WorkerMessage`] received by a pinned worker task.
+///
+/// Extracted from the monolithic `spawn_pinned` closure so that both
+/// [`create_direct_client`] and [`create_handle_for_client`] share identical
+/// dispatch logic without duplication.
+fn run_worker_message(
+    msg: WorkerMessage,
+    client: &glide_core::client::Client,
+    worker_inflight: &Arc<AtomicIsize>,
+    response_buffer_worker: &Arc<ResponseBuffer>,
+    wake_tsfn_worker: &std::sync::Weak<ThreadsafeFunction<(), (), (), Status, false>>,
+) {
+    match msg {
+        WorkerMessage::Command(cmd_msg) => {
+            let mut client_clone = client.clone();
+            let mut cmd = cmd_msg.cmd;
+            let callback_idx = cmd_msg.callback_idx;
+            let routing = cmd_msg.routing;
+            let pool_blocking_ids = cmd_msg.pool_blocking_ids;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                // RAII guard: refreshes activity and clears the blocking flag on all exit
+                // paths (normal completion, early return, and task cancellation/drop).
+                let _unmark_guard = pool_blocking_ids
+                    .and_then(|cid| glide_core::pool::get_blocking_flag(cid).map(|arc| (cid, arc)))
+                    .map(|(cid, arc)| UnmarkOnDrop(Some(arc), Some(cid)));
+                if let Some(ref span) = cmd.span() {
+                    set_db_attributes(span, &cmd, &client_clone);
+                }
+                let result =
+                    match prepare_command_for_execution(&mut cmd, &client_clone, "send_command") {
+                        Ok(()) => client_clone.send_command(&mut cmd, routing).await,
+                        Err(err) => Err(err),
+                    };
+                let response = build_response(callback_idx, result, cmd.span());
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::Batch(batch_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = batch_msg.callback_idx;
+            let pool_ids = batch_msg.pool_ids;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                // RAII guard: refreshes activity and clears the blocking flag on all exit
+                // paths (normal completion, early return, and task cancellation/drop).
+                let _unmark_guard = pool_ids
+                    .and_then(|cid| glide_core::pool::get_blocking_flag(cid).map(|arc| (cid, arc)))
+                    .map(|(cid, arc)| UnmarkOnDrop(Some(arc), Some(cid)));
+                let command_span = batch_msg.command_span.clone();
+                let result = execute_batch(
+                    &mut client_clone,
+                    batch_msg.commands,
+                    batch_msg.is_atomic,
+                    batch_msg.raise_on_error,
+                    batch_msg.timeout,
+                    batch_msg.retry_server_error,
+                    batch_msg.retry_connection_error,
+                    batch_msg.routing,
+                    batch_msg.command_span,
+                )
+                .await;
+                let response = build_response(callback_idx, result, command_span);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::ScriptInvocation(script_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = script_msg.callback_idx;
+            let pool_ids = script_msg.pool_ids;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                // RAII guard: refreshes activity and clears the blocking flag on all exit
+                // paths (normal completion, early return, and task cancellation/drop).
+                let _unmark_guard = pool_ids
+                    .and_then(|cid| glide_core::pool::get_blocking_flag(cid).map(|arc| (cid, arc)))
+                    .map(|(cid, arc)| UnmarkOnDrop(Some(arc), Some(cid)));
+                let keys: Vec<&[u8]> = script_msg.keys.iter().map(|k| k.as_ref()).collect();
+                let args: Vec<&[u8]> = script_msg.args.iter().map(|a| a.as_ref()).collect();
+                let result = client_clone
+                    .invoke_script(&script_msg.hash, &keys, &args, script_msg.routing)
+                    .await;
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::ClusterScan(scan_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = scan_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let cursor_result = if scan_msg.cursor.is_empty() {
+                    Ok(ScanStateRC::new())
+                } else {
+                    get_cluster_scan_cursor(scan_msg.cursor)
+                };
+
+                let result = match cursor_result {
+                    Ok(scan_cursor) => {
+                        let mut args_builder = ClusterScanArgs::builder()
+                            .allow_non_covered_slots(scan_msg.allow_non_covered_slots);
+                        if let Some(pattern) = scan_msg.match_pattern {
+                            args_builder = args_builder.with_match_pattern::<Bytes>(pattern);
+                        }
+                        if let Some(count) = scan_msg.count {
+                            args_builder = args_builder.with_count(count as u32);
+                        }
+                        if let Some(obj_type) = scan_msg.object_type {
+                            args_builder = args_builder.with_object_type(obj_type.into());
+                        }
+                        let scan_args = args_builder.build();
+                        client_clone.cluster_scan(&scan_cursor, scan_args).await
+                    }
+                    Err(e) => Err(e),
+                };
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::UpdateConnectionPassword(pwd_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = pwd_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let result = client_clone
+                    .update_connection_password(pwd_msg.password, pwd_msg.immediate_auth)
+                    .await;
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::RefreshIamToken(iam_msg) => {
+            let mut client_clone = client.clone();
+            let callback_idx = iam_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let result = client_clone.refresh_iam_token().await.map(|()| Value::Okay);
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+        WorkerMessage::GetCacheMetrics(metrics_msg) => {
+            let client_clone = client.clone();
+            let callback_idx = metrics_msg.callback_idx;
+            let inflight = Arc::clone(worker_inflight);
+            let buffer = Arc::clone(response_buffer_worker);
+            let wake = wake_tsfn_worker.clone();
+
+            task::spawn_local(async move {
+                let result = get_cache_metrics(&client_clone, metrics_msg.metrics_type);
+                let response = build_response(callback_idx, result, None);
+                inflight.fetch_add(1, Ordering::Release);
+                if buffer.push(response)
+                    && let Some(wake_callback) = wake.upgrade()
+                {
+                    wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        }
+    }
+}
+
+struct CredentialProviderClaim {
+    key: String,
+    provider: Option<glide_core::iam::CredentialsProvider>,
+}
+
+impl CredentialProviderClaim {
+    fn commit(&mut self) {
+        self.provider = None;
+    }
+}
+
+impl Drop for CredentialProviderClaim {
+    fn drop(&mut self) {
+        let Some(provider) = self.provider.take() else {
+            return;
+        };
+        if glide_core::credential_provider_registry::register_if_absent(self.key.clone(), provider)
+            .is_err()
+        {
+            log_warn(
+                "credential_provider",
+                format!(
+                    "Did not restore credential_provider_key '{}' because a newer provider is registered",
+                    self.key
+                ),
+            );
+        }
+    }
+}
+
+fn claim_credential_provider(
+    key: Option<String>,
+    request: &mut ConnectionRequest,
+) -> Result<Option<CredentialProviderClaim>> {
+    if key.as_deref().is_some_and(|value| value.trim().is_empty()) {
+        return Err(napi::Error::new(
+            Status::InvalidArg,
+            "credential_provider_key must not be empty or whitespace",
+        ));
+    }
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let iam = request.authentication_info.as_mut()
+        .and_then(|auth| auth.iam_config.as_mut())
+        .ok_or_else(|| napi::Error::new(
+            Status::InvalidArg,
+            "credential_provider_key was set but the connection request contains no IAM configuration",
+        ))?;
+    let provider = glide_core::credential_provider_registry::remove(&key).ok_or_else(|| {
+        napi::Error::new(
+            Status::InvalidArg,
+            format!("credential_provider_key '{key}' was not found in the registry; it may have already been consumed"),
+        )
+    })?;
+    iam.credentials_provider = Some(provider.clone());
+    Ok(Some(CredentialProviderClaim {
+        key,
+        provider: Some(provider),
+    }))
+}
+
+/// Provider-specific deferred result. The registry claim commits only after
+/// napi-rs successfully converts the native handle into a JavaScript object.
+struct DirectClientResolution {
+    handle: GlideClientHandle,
+    credential_provider_claim: Option<CredentialProviderClaim>,
+}
+
+impl ToNapiValue for DirectClientResolution {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        mut value: Self,
+    ) -> Result<napi::sys::napi_value> {
+        #[cfg(feature = "testing_utilities")]
+        let provider_backed = value.handle.provider_cleanup.is_some();
+        let js_handle = unsafe { GlideClientHandle::to_napi_value(env, value.handle) }?;
+        if let Some(claim) = value.credential_provider_claim.as_mut() {
+            claim.commit();
+        }
+        #[cfg(feature = "testing_utilities")]
+        if provider_backed
+            && FAIL_PROVIDER_DIRECT_RESOLUTION_AFTER_CONVERSION.swap(false, Ordering::SeqCst)
+        {
+            // Conversion transferred ownership to the N-API wrapper. Recover that
+            // exact handle on this JS thread and run the normal full close path;
+            // its eventual finalizer observes `closed` and does nothing.
+            unsafe { close_converted_provider_direct_handle(env, js_handle) }?;
+            return Err(napi::Error::new(
+                Status::GenericFailure,
+                "Injected provider direct-client failure after native handle conversion",
+            ));
+        }
+        Ok(js_handle)
+    }
+}
+
+#[cfg(feature = "testing_utilities")]
+unsafe fn close_converted_provider_direct_handle(
+    env: napi::sys::napi_env,
+    js_handle: napi::sys::napi_value,
+) -> Result<()> {
+    let mut native_handle = std::ptr::null_mut();
+    let status = unsafe { napi::sys::napi_unwrap(env, js_handle, &mut native_handle) };
+    if status != napi::sys::Status::napi_ok {
+        return Err(napi::Error::new(
+            Status::GenericFailure,
+            format!("Failed to recover converted provider direct-client handle: {status:?}"),
+        ));
+    }
+    let handle = unsafe {
+        native_handle
+            .cast::<GlideClientHandle>()
+            .as_mut()
+            .ok_or_else(|| {
+                napi::Error::new(
+                    Status::GenericFailure,
+                    "Converted provider direct-client handle was null",
+                )
+            })?
+    };
+    handle.close()
+}
+
+/// Arms a provider-direct-only one-shot failure after native handle conversion.
+/// @internal @test
+#[napi(js_name = "injectProviderDirectResolutionFailureAfterConversion")]
+#[cfg(feature = "testing_utilities")]
+pub fn inject_provider_direct_resolution_failure_after_conversion() {
+    PROVIDER_DIRECT_CLEANUP_COUNT.store(0, Ordering::SeqCst);
+    FAIL_PROVIDER_DIRECT_RESOLUTION_AFTER_CONVERSION.store(true, Ordering::SeqCst);
+}
+
+/// Returns how many provider-direct handles released scope ownership.
+/// @internal @test
+#[napi(js_name = "getProviderDirectCleanupCount")]
+#[cfg(feature = "testing_utilities")]
+pub fn get_provider_direct_cleanup_count() -> u32 {
+    PROVIDER_DIRECT_CLEANUP_COUNT.load(Ordering::SeqCst) as u32
+}
+
+/// Returns how many provider-direct handles still own native resources.
+/// @internal @test
+#[napi(js_name = "getProviderDirectOpenHandleCount")]
+#[cfg(feature = "testing_utilities")]
+pub fn get_provider_direct_open_handle_count() -> u32 {
+    PROVIDER_DIRECT_OPEN_HANDLE_COUNT.load(Ordering::SeqCst) as u32
 }
 
 /// Creates a new direct NAPI client connection with response buffering.
@@ -802,14 +1496,8 @@ pub fn create_direct_client<'a>(
     connection_request_bytes: Uint8Array,
     #[napi(ts_arg_type = "() => void")] wake_callback: Function<(), ()>,
 ) -> Result<Object<'a>> {
-    let (deferred, promise) = env.create_deferred()?;
-
-    // Create the wake-up ThreadsafeFunction
-    // This callback takes no arguments - it just signals "responses available"
-    let wake_tsfn: Arc<ThreadsafeFunction<(), (), (), Status, false>> =
-        Arc::new(wake_callback.build_threadsafe_function().build()?);
-
-    // Parse the connection request protobuf
+    // Parse and validate provider semantics before allocating NAPI resources. A claimed provider is
+    // restored by its RAII guard on every failure until direct-client creation commits the claim.
     let proto_connection_request =
         match ProtobufConnectionRequest::parse_from_bytes(&connection_request_bytes) {
             Ok(req) => req,
@@ -825,6 +1513,10 @@ pub fn create_direct_client<'a>(
         .as_ref()
         .filter(|key| !key.is_empty())
         .map(ToString::to_string);
+    let credential_provider_key = proto_connection_request
+        .credential_provider_key
+        .as_ref()
+        .map(ToString::to_string);
 
     // Get the inflight requests limit from the protobuf connection request
     let inflight_requests_limit = if proto_connection_request.inflight_requests_limit > 0 {
@@ -835,6 +1527,33 @@ pub fn create_direct_client<'a>(
 
     // Convert protobuf ConnectionRequest to internal ConnectionRequest
     let mut connection_request: ConnectionRequest = proto_connection_request.into();
+    let credential_provider_claim =
+        claim_credential_provider(credential_provider_key, &mut connection_request)?;
+
+    type DirectClientDeferredValue = Either<DirectClientResolution, ()>;
+    type DirectClientDeferredResolver = Box<dyn FnOnce(Env) -> Result<DirectClientDeferredValue>>;
+
+    // Preserve Deferred-before-wake-TSFN ordering. Restore a claimed provider
+    // before returning any construction error to JavaScript.
+    let (deferred, promise) =
+        match env.create_deferred::<DirectClientDeferredValue, DirectClientDeferredResolver>() {
+            Ok(deferred_and_promise) => deferred_and_promise,
+            Err(error) => {
+                drop(credential_provider_claim);
+                return Err(error);
+            }
+        };
+    let wake_tsfn: Arc<ThreadsafeFunction<(), (), (), Status, false>> =
+        match wake_callback.build_threadsafe_function().build() {
+            Ok(callback) => Arc::new(callback),
+            Err(error) => {
+                drop(credential_provider_claim);
+                // Settle the otherwise unreachable deferred to release its TSFN.
+                deferred.resolve(Box::new(|_| Ok(Either::B(()))));
+                return Err(error);
+            }
+        };
+
     if let Some(key) = resolver_key
         && let Some(resolver) = glide_core::address_resolver_registry::remove(&key)
     {
@@ -861,13 +1580,20 @@ pub fn create_direct_client<'a>(
     let response_buffer_push = Arc::clone(&response_buffer);
     let wake_tsfn_push = Arc::downgrade(&wake_tsfn);
 
-    // Spawn a pinned worker task that owns the Client and processes commands
-    // This task will run on a dedicated thread and never migrate
+    // Spawn a pinned worker task that owns the Client and processes commands.
+    // Client::new is called INSIDE spawn_pinned so the push listener is set up
+    // atomically with the connection — this prevents a race where PubSub push
+    // notifications (subscription confirmations) arrive before the listener task
+    // is running, which would cause them to buffer silently with no wake_callback
+    // fired, resulting in PubSub tests timing out.
     worker_pool.spawn_pinned(move || async move {
         // Create the client on this worker thread
         let client = match Client::new(connection_request, Some(push_sender)).await {
             Ok(c) => c,
             Err(err) => {
+                // Restore before rejection: JavaScript cleanup may run as soon as
+                // deferred settlement is queued.
+                drop(credential_provider_claim);
                 deferred.reject(napi::Error::new(
                     Status::Unknown,
                     format!("Failed to create client: {err}"),
@@ -878,42 +1604,57 @@ pub fn create_direct_client<'a>(
             }
         };
 
-        // Create handle to return to JavaScript
-        // Clone command_tx for the handle - the original will be dropped after this
-        let command_tx_for_handle = command_tx.clone();
-
-        // Drop the original command_tx so only the handle holds a sender.
+        // Create handle to return to JavaScript.
+        // Clone command_tx for the handle — the original will be dropped after this.
         // This ensures the channel closes when the handle is dropped,
         // which allows the message loop below to exit.
+        let command_tx_for_handle = command_tx.clone();
         drop(command_tx);
 
         let inflight_counter = Arc::new(AtomicIsize::new(inflight_requests_limit));
-        let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+        let client_id = glide_core::pool::allocate_client_id();
 
         // Register client in scope registry so scoped connections can find
         // their parent client for compression, timeout, IAM, and CB checks.
         glide_core::scope::register_client(client_id, client.clone());
 
+        let provider_cleanup = credential_provider_claim
+            .is_some()
+            .then(|| Arc::new(ProviderDirectClientCleanup::new(client_id)));
+        #[cfg(feature = "testing_utilities")]
+        let provider_handle_open = provider_cleanup.is_some();
+        #[cfg(feature = "testing_utilities")]
+        if provider_handle_open {
+            PROVIDER_DIRECT_OPEN_HANDLE_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
         let handle = GlideClientHandle {
             command_tx: Some(command_tx_for_handle),
             inflight_requests: inflight_counter.clone(),
             response_buffer: Arc::clone(&response_buffer_worker),
             wake_callback: Some(Arc::clone(&wake_tsfn)),
             client_id,
+            provider_cleanup,
+            closed: false,
+            #[cfg(feature = "testing_utilities")]
+            provider_handle_open,
         };
 
-        // Resolve the promise with the handle
-        deferred.resolve(|_| Ok(handle));
-
-        // Store worker-local references to avoid Arc::clone per command
-        // These are cloned ONCE here and reused for all commands
+        // Store worker-local references to avoid Arc::clone per command.
+        // These are cloned ONCE here and reused for all commands.
         let worker_inflight = inflight_counter;
 
         // Spawn a local task to listen for push notifications (pub/sub).
         // Use a weak wake handle to avoid extending callback lifetime after close().
-        // Push messages arrive from glide-core via the push_receiver channel
+        // Push messages arrive from glide-core via the push_receiver channel.
+        // NOTE: push listener is spawned BEFORE resolving the promise so that
+        // cluster-mode push notifications (e.g. subscription confirmations)
+        // cannot arrive in the window between promise resolution and listener
+        // scheduling.
         task::spawn_local(async move {
             while let Some(push_info) = push_receiver.recv().await {
+                if handle_disconnection_push(&push_info) {
+                    continue;
+                }
                 let push_value = Value::Push {
                     kind: push_info.kind,
                     data: push_info.data,
@@ -937,228 +1678,28 @@ pub fn create_direct_client<'a>(
             }
         });
 
-        // Process messages from the channel
-        // Each message spawns a local task for concurrent execution within this thread
+        // Resolve only after the push listener is scheduled. The provider claim
+        // remains rollback-capable until GlideClientHandle conversion succeeds.
+        deferred.resolve(Box::new(move |_| {
+            Ok(Either::A(DirectClientResolution {
+                handle,
+                credential_provider_claim,
+            }))
+        }));
+
+        // Process messages from the channel.
+        // Each message spawns a local task for concurrent execution within this thread.
         while let Some(msg) = command_rx.recv().await {
-            match msg {
-                WorkerMessage::Command(cmd_msg) => {
-                    let mut client_clone = client.clone();
-                    let mut cmd = cmd_msg.cmd;
-                    let callback_idx = cmd_msg.callback_idx;
-                    let routing = cmd_msg.routing;
-                    let pool_blocking_ids = cmd_msg.pool_blocking_ids;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    // Spawn local task for this command
-                    task::spawn_local(async move {
-                        if let Some(ref span) = cmd.span() {
-                            set_db_attributes(span, &cmd, &client_clone);
-                        }
-                        let result = match prepare_command_for_execution(
-                            &mut cmd,
-                            &client_clone,
-                            "send_command",
-                        ) {
-                            Ok(()) => client_clone.send_command(&mut cmd, routing).await,
-                            Err(err) => Err(err),
-                        };
-                        // Unmark blocking after command completes
-                        if let Some(client_id) = pool_blocking_ids {
-                            pool::mark_blocking(client_id, false);
-                        }
-                        let response = build_response(callback_idx, result, cmd.span());
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::Batch(batch_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = batch_msg.callback_idx;
-                    let pool_ids = batch_msg.pool_ids;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    // Spawn local task for batch execution
-                    task::spawn_local(async move {
-                        // Mark as blocking for duration of batch execution.
-                        // Conservative: prevents abandon monitor from discarding a client
-                        // mid-batch even if abandon_timeout < batch execution time.
-                        if let Some(client_id) = pool_ids {
-                            pool::mark_blocking(client_id, true);
-                        }
-                        let command_span = batch_msg.command_span.clone();
-                        let result = execute_batch(
-                            &mut client_clone,
-                            batch_msg.commands,
-                            batch_msg.is_atomic,
-                            batch_msg.raise_on_error,
-                            batch_msg.timeout,
-                            batch_msg.retry_server_error,
-                            batch_msg.retry_connection_error,
-                            batch_msg.routing,
-                            batch_msg.command_span,
-                        )
-                        .await;
-                        // Unmark blocking after batch completes
-                        if let Some(client_id) = pool_ids {
-                            pool::mark_blocking(client_id, false);
-                        }
-                        let response = build_response(callback_idx, result, command_span);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::ScriptInvocation(script_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = script_msg.callback_idx;
-                    let pool_ids = script_msg.pool_ids;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        // Mark as blocking for duration of script execution.
-                        // Conservative: prevents abandon monitor from discarding a client
-                        // mid-script even if abandon_timeout < script execution time.
-                        if let Some(client_id) = pool_ids {
-                            pool::mark_blocking(client_id, true);
-                        }
-                        let keys: Vec<&[u8]> = script_msg.keys.iter().map(|k| k.as_ref()).collect();
-                        let args: Vec<&[u8]> = script_msg.args.iter().map(|a| a.as_ref()).collect();
-                        let result = client_clone
-                            .invoke_script(&script_msg.hash, &keys, &args, script_msg.routing)
-                            .await;
-                        // Unmark blocking after script completes
-                        if let Some(client_id) = pool_ids {
-                            pool::mark_blocking(client_id, false);
-                        }
-                        let response = build_response(callback_idx, result, None);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::ClusterScan(scan_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = scan_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        // Get or create scan cursor
-                        let cursor_result = if scan_msg.cursor.is_empty() {
-                            Ok(ScanStateRC::new())
-                        } else {
-                            get_cluster_scan_cursor(scan_msg.cursor)
-                        };
-
-                        let result = match cursor_result {
-                            Ok(scan_cursor) => {
-                                // Build scan args
-                                let mut args_builder = ClusterScanArgs::builder()
-                                    .allow_non_covered_slots(scan_msg.allow_non_covered_slots);
-                                if let Some(pattern) = scan_msg.match_pattern {
-                                    args_builder =
-                                        args_builder.with_match_pattern::<Bytes>(pattern);
-                                }
-                                if let Some(count) = scan_msg.count {
-                                    args_builder = args_builder.with_count(count as u32);
-                                }
-                                if let Some(obj_type) = scan_msg.object_type {
-                                    args_builder = args_builder.with_object_type(obj_type.into());
-                                }
-                                let scan_args = args_builder.build();
-                                client_clone.cluster_scan(&scan_cursor, scan_args).await
-                            }
-                            Err(e) => Err(e),
-                        };
-                        let response = build_response(callback_idx, result, None);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::UpdateConnectionPassword(pwd_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = pwd_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        let result = client_clone
-                            .update_connection_password(pwd_msg.password, pwd_msg.immediate_auth)
-                            .await;
-                        let response = build_response(callback_idx, result, None);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::RefreshIamToken(iam_msg) => {
-                    let mut client_clone = client.clone();
-                    let callback_idx = iam_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        let result = client_clone.refresh_iam_token().await.map(|()| Value::Okay);
-                        let response = build_response(callback_idx, result, None);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-                WorkerMessage::GetCacheMetrics(metrics_msg) => {
-                    let client_clone = client.clone();
-                    let callback_idx = metrics_msg.callback_idx;
-                    let inflight = Arc::clone(&worker_inflight);
-                    let buffer = Arc::clone(&response_buffer_worker);
-                    let wake = wake_tsfn_worker.clone();
-
-                    task::spawn_local(async move {
-                        let result = get_cache_metrics(&client_clone, metrics_msg.metrics_type);
-                        let response = build_response(callback_idx, result, None);
-                        inflight.fetch_add(1, Ordering::Release);
-                        if buffer.push(response)
-                            && let Some(wake_callback) = wake.upgrade()
-                        {
-                            wake_callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    });
-                }
-            }
+            run_worker_message(
+                msg,
+                &client,
+                &worker_inflight,
+                &response_buffer_worker,
+                &wake_tsfn_worker,
+            );
         }
 
-        // Message loop has exited (channel closed by client.close()).
-        // Release our reference to the worker pool.
-        // When all clients have released their references, the pool will be dropped,
-        // allowing worker threads to exit and Node.js to terminate cleanly.
+        // Message loop has exited (channel closed by handle.close()).
         release_worker_pool();
     });
 
@@ -1276,10 +1817,8 @@ impl GlideClientHandle {
         let command_span_for_error = cmd.span();
 
         // Pool abandon detection: refresh activity and mark blocking commands
-        let pool_blocking_ids = if pool::any_pool_clients()
-            && pool::get_client_pool_map().contains_key(&self.client_id)
-        {
-            pool::refresh_activity(self.client_id);
+        let pool_blocking_ids = if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
             if glide_core::client::is_blocking_command(&cmd)
                 && pool::mark_blocking(self.client_id, true)
             {
@@ -1341,12 +1880,21 @@ impl GlideClientHandle {
     /// which prevents use-after-free crashes during shutdown.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
-        // IMPORTANT: Mark closed FIRST to prevent any in-flight tasks from calling wake_callback
+        if self.closed {
+            return Ok(());
+        }
+
+        // IMPORTANT: Mark the response buffer closed first to prevent any in-flight tasks from calling wake_callback
         // This prevents segfaults when the ThreadsafeFunction is dropped while tasks are running
         self.response_buffer.mark_closed();
 
-        // Unregister from scope registry
-        glide_core::scope::unregister_client(self.client_id);
+        // Provider-backed direct handles use their finalization marker so close
+        // and a later Drop cannot release the same scope ownership twice.
+        if let Some(cleanup) = self.provider_cleanup.as_ref() {
+            cleanup.unregister();
+        } else {
+            glide_core::scope::unregister_client(self.client_id);
+        }
 
         // Free any leaked Value pointers in pending responses that were never consumed by JS
         self.response_buffer.free_leaked_values();
@@ -1362,6 +1910,59 @@ impl GlideClientHandle {
         // when the message loop exits (which happens after command_tx is dropped above).
         drop(self.wake_callback.take());
 
+        // Unlike the provider scope marker, this count represents completion of
+        // the entire native close routine above.
+        #[cfg(feature = "testing_utilities")]
+        if std::mem::take(&mut self.provider_handle_open) {
+            PROVIDER_DIRECT_OPEN_HANDLE_COUNT.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        // Publish full-handle completion only after provider teardown and every
+        // native resource/counter side effect. A panic before here remains retryable.
+        self.closed = true;
+        Ok(())
+    }
+
+    /// Stop this handle's worker thread WITHOUT removing the client from the
+    /// scope registry.
+    ///
+    /// Used by pool clients: when a pool client is released back to the pool,
+    /// its underlying [`glide_core::client::Client`] must remain registered in
+    /// the scope registry so that the next `pool_build_handle` call can find it
+    /// and spin up a new worker for the next borrower.
+    ///
+    /// For standalone (non-pool) clients, call `close()` instead.
+    #[napi]
+    pub fn close_for_pool_release(&mut self) -> Result<()> {
+        // A provider-backed handle is a standalone direct client, even if this
+        // pool-only entry point is called accidentally. It must run full cleanup.
+        if self.provider_cleanup.is_some() {
+            return self.close();
+        }
+        if self.closed {
+            return Ok(());
+        }
+
+        // Mark buffer closed first — prevents callbacks after this point.
+        self.response_buffer.mark_closed();
+
+        // Do NOT unregister from scope registry: the Client must stay registered
+        // so that the next pool_build_handle() call can find it.
+
+        // Do NOT call unregister_pool_client here: release_client_async (called
+        // by pool_release after this) already calls unregister_pool_client, so
+        // calling it here would result in a double-unregister.
+
+        // Free any leaked Value pointers.
+        self.response_buffer.free_leaked_values();
+
+        // Drop command_tx to signal the worker loop to exit.
+        drop(self.command_tx.take());
+
+        // Drop the wake callback reference.
+        drop(self.wake_callback.take());
+
+        self.closed = true;
         Ok(())
     }
 
@@ -1492,14 +2093,19 @@ impl GlideClientHandle {
         let command_span_for_error = command_span.clone();
 
         // Pool abandon detection: refresh activity for batch duration
-        let pool_ids = if pool::any_pool_clients()
-            && pool::get_client_pool_map().contains_key(&self.client_id)
-        {
-            pool::refresh_activity(self.client_id);
+        let pool_ids = if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
             Some(self.client_id)
         } else {
             None
         };
+
+        // Set is_blocking synchronously on the sender thread BEFORE channel send,
+        // so the abandon monitor cannot observe is_blocking=false in the window
+        // between enqueue and the worker thread dequeuing the message (#6971).
+        if let Some(client_id) = pool_ids {
+            pool::mark_blocking(client_id, true);
+        }
 
         // Send batch message to worker
         let msg = WorkerMessage::Batch(BatchCommandMessage {
@@ -1520,6 +2126,10 @@ impl GlideClientHandle {
             None => true,
         };
         if send_failed {
+            // Sender-side mark was already applied; undo it since the message was never delivered.
+            if let Some(client_id) = pool_ids {
+                pool::mark_blocking(client_id, false);
+            }
             self.inflight_requests.fetch_add(1, Ordering::Relaxed);
             mark_span_error(&command_span_for_error, "Client connection closed");
             let response = CommandResponse {
@@ -1592,14 +2202,19 @@ impl GlideClientHandle {
         };
 
         // Pool abandon detection: refresh activity for script execution
-        let pool_ids = if pool::any_pool_clients()
-            && pool::get_client_pool_map().contains_key(&self.client_id)
-        {
-            pool::refresh_activity(self.client_id);
+        let pool_ids = if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
             Some(self.client_id)
         } else {
             None
         };
+
+        // Set is_blocking synchronously on the sender thread BEFORE channel send,
+        // so the abandon monitor cannot observe is_blocking=false in the window
+        // between enqueue and the worker thread dequeuing the message (#6971).
+        if let Some(client_id) = pool_ids {
+            pool::mark_blocking(client_id, true);
+        }
 
         let msg = WorkerMessage::ScriptInvocation(ScriptInvocationMessage {
             callback_idx,
@@ -1615,6 +2230,10 @@ impl GlideClientHandle {
             None => true,
         };
         if send_failed {
+            // Sender-side mark was already applied; undo it since the message was never delivered.
+            if let Some(client_id) = pool_ids {
+                pool::mark_blocking(client_id, false);
+            }
             self.inflight_requests.fetch_add(1, Ordering::Relaxed);
             let response = CommandResponse {
                 callback_idx,
@@ -1663,8 +2282,8 @@ impl GlideClientHandle {
         });
 
         // Pool abandon detection: refresh activity for scan
-        if pool::any_pool_clients() && pool::get_client_pool_map().contains_key(&self.client_id) {
-            pool::refresh_activity(self.client_id);
+        if glide_core::pool::is_pool_client(self.client_id) {
+            glide_core::pool::refresh_activity_by_client(self.client_id);
         }
 
         let send_failed = match &self.command_tx {
@@ -1817,18 +2436,20 @@ impl GlideClientHandle {
 
 impl Drop for GlideClientHandle {
     fn drop(&mut self) {
-        // Ensure cleanup happens even if close() was never called.
-        // mark_closed() is idempotent (uses AtomicBool), so calling it again is safe.
+        if self.closed {
+            return;
+        }
+
+        // Provider-backed direct handles use the same complete close routine as
+        // explicit close and post-conversion fault recovery.
+        if self.provider_cleanup.is_some() {
+            let _ = self.close();
+            return;
+        }
+
+        // Preserve the ordinary direct/pool fallback finalization behavior.
         self.response_buffer.mark_closed();
-
-        // Free any leaked Value pointers in pending responses.
-        // If close() already called this, the buffer will be empty and this is a no-op.
         self.response_buffer.free_leaked_values();
-
-        // Drop the command channel to signal worker to exit.
-        // If already dropped by close(), this is a no-op.
-        // The spawned worker task will call release_worker_pool() when its message loop exits,
-        // which happens after this channel is closed.
         drop(self.command_tx.take());
     }
 }
@@ -1975,40 +2596,40 @@ pub fn init_open_telemetry(open_telemetry_config: OpenTelemetryConfig) -> Result
     Ok(())
 }
 
-impl From<logger_core::Level> for Level {
-    fn from(level: logger_core::Level) -> Self {
+impl From<glide_logger::Level> for Level {
+    fn from(level: glide_logger::Level) -> Self {
         match level {
-            logger_core::Level::Error => Level::Error,
-            logger_core::Level::Warn => Level::Warn,
-            logger_core::Level::Info => Level::Info,
-            logger_core::Level::Debug => Level::Debug,
-            logger_core::Level::Trace => Level::Trace,
-            logger_core::Level::Off => Level::Off,
+            glide_logger::Level::Error => Level::Error,
+            glide_logger::Level::Warn => Level::Warn,
+            glide_logger::Level::Info => Level::Info,
+            glide_logger::Level::Debug => Level::Debug,
+            glide_logger::Level::Trace => Level::Trace,
+            glide_logger::Level::Off => Level::Off,
         }
     }
 }
 
-impl From<Level> for logger_core::Level {
-    fn from(level: Level) -> logger_core::Level {
+impl From<Level> for glide_logger::Level {
+    fn from(level: Level) -> glide_logger::Level {
         match level {
-            Level::Error => logger_core::Level::Error,
-            Level::Warn => logger_core::Level::Warn,
-            Level::Info => logger_core::Level::Info,
-            Level::Debug => logger_core::Level::Debug,
-            Level::Trace => logger_core::Level::Trace,
-            Level::Off => logger_core::Level::Off,
+            Level::Error => glide_logger::Level::Error,
+            Level::Warn => glide_logger::Level::Warn,
+            Level::Info => glide_logger::Level::Info,
+            Level::Debug => glide_logger::Level::Debug,
+            Level::Trace => glide_logger::Level::Trace,
+            Level::Off => glide_logger::Level::Off,
         }
     }
 }
 
 #[napi]
 pub fn log(log_level: Level, log_identifier: String, message: String) {
-    logger_core::log(log_level.into(), log_identifier, message);
+    glide_logger::log(log_level.into(), log_identifier, message);
 }
 
 #[napi(js_name = "InitInternalLogger")]
 pub fn init(level: Option<Level>, file_name: Option<String>) -> Level {
-    let logger_level = logger_core::init(level.map(|level| level.into()), file_name.as_deref());
+    let logger_level = glide_logger::init(level.map(|level| level.into()), file_name.as_deref());
     logger_level.into()
 }
 
@@ -2642,18 +3263,26 @@ pub fn create_monitor_client<'a>(
     )]
     callback: MonitorCallback<'_>,
 ) -> Result<Object<'a>> {
-    let (deferred, promise) = env.create_deferred()?;
     let conn_req =
         connection_request::ConnectionRequest::parse_from_bytes(&connection_request_bytes)
             .map_err(|e| napi::Error::new(Status::InvalidArg, e.to_string()))?;
+    if conn_req.credential_provider_key.is_some()
+        || conn_req
+            .authentication_info
+            .as_ref()
+            .is_some_and(|auth| auth.iam_credentials.is_some())
+    {
+        return Err(napi::Error::new(
+            Status::InvalidArg,
+            "Monitor clients do not support IAM authentication or credential_provider_key",
+        ));
+    }
+    let (deferred, promise) = env.create_deferred()?;
     let proto_addr = conn_req
         .addresses
         .first()
         .ok_or_else(|| napi::Error::new(Status::InvalidArg, "No addresses provided"))?;
-    let address = NodeAddress {
-        host: proto_addr.host.to_string(),
-        port: proto_addr.port as u16,
-    };
+    let address = NodeAddress::from(proto_addr);
     let tls_mode = match conn_req.tls_mode.enum_value_or_default() {
         connection_request::TlsMode::NoTls => TlsMode::NoTls,
         connection_request::TlsMode::SecureTls => TlsMode::SecureTls,
@@ -2716,6 +3345,273 @@ pub fn create_monitor_client<'a>(
     Ok(promise)
 }
 
+/// Return value from a JavaScript GlideCredentialProvider callback.
+#[napi(object)]
+pub struct JsAwsCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+    /// Optional expiry as Unix epoch milliseconds. Use 0 or None to indicate no expiry.
+    pub expires_at_epoch_millis: Option<f64>,
+}
+
+/// A Node.js credential provider wrapper.
+/// It holds a `ThreadsafeFunction` that invokes the JS callback and delivers
+/// the resulting `JsAwsCredentials` back to the calling thread via a channel.
+/// The callback may return either a plain `JsAwsCredentials` or a
+/// `Promise<JsAwsCredentials>`; both are handled transparently.
+type CredentialProviderTsfn = ThreadsafeFunction<(), Unknown<'static>, (), Status, false, true>;
+
+struct NodeCredentialsProvider {
+    tsfn: CredentialProviderTsfn,
+}
+
+const NODE_CREDENTIALS_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9);
+
+type NodeCredentialResult = (
+    String,
+    String,
+    Option<String>,
+    Option<std::time::SystemTime>,
+);
+
+const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+fn checked_expiry_from(
+    base: std::time::SystemTime,
+    milliseconds: i64,
+) -> std::result::Result<std::time::SystemTime, glide_core::iam::GlideIAMError> {
+    base.checked_add(std::time::Duration::from_millis(milliseconds as u64))
+        .ok_or_else(|| {
+            glide_core::iam::GlideIAMError::CredentialsError(format!(
+                "GlideCredentialProvider expiresAtEpochMillis is out of range: {milliseconds}"
+            ))
+        })
+}
+
+fn convert_expiry(
+    milliseconds: f64,
+) -> std::result::Result<Option<std::time::SystemTime>, glide_core::iam::GlideIAMError> {
+    if !milliseconds.is_finite()
+        || milliseconds.fract() != 0.0
+        || milliseconds.abs() > JS_MAX_SAFE_INTEGER
+    {
+        return Err(glide_core::iam::GlideIAMError::CredentialsError(format!(
+            "GlideCredentialProvider expiresAtEpochMillis must be a finite safe integer: {milliseconds}"
+        )));
+    }
+    if milliseconds <= 0.0 {
+        return Ok(None);
+    }
+
+    let milliseconds = milliseconds as i64;
+    checked_expiry_from(std::time::SystemTime::UNIX_EPOCH, milliseconds).map(Some)
+}
+
+fn validate_and_convert_credentials(
+    credentials: JsAwsCredentials,
+) -> std::result::Result<NodeCredentialResult, glide_core::iam::GlideIAMError> {
+    if credentials.access_key_id.trim().is_empty() {
+        return Err(glide_core::iam::GlideIAMError::CredentialsError(
+            "GlideCredentialProvider returned a blank accessKeyId".to_string(),
+        ));
+    }
+    if credentials.secret_access_key.trim().is_empty() {
+        return Err(glide_core::iam::GlideIAMError::CredentialsError(
+            "GlideCredentialProvider returned a blank secretAccessKey".to_string(),
+        ));
+    }
+
+    let expires_at = credentials
+        .expires_at_epoch_millis
+        .map(convert_expiry)
+        .transpose()?
+        .flatten();
+
+    Ok((
+        credentials.access_key_id,
+        credentials.secret_access_key,
+        credentials.session_token,
+        expires_at,
+    ))
+}
+
+// SAFETY: ThreadsafeFunction is designed to be called from any thread.
+unsafe impl Send for NodeCredentialsProvider {}
+unsafe impl Sync for NodeCredentialsProvider {}
+
+impl NodeCredentialsProvider {
+    fn get_credentials(
+        &self,
+    ) -> std::result::Result<
+        (
+            String,
+            String,
+            Option<String>,
+            Option<std::time::SystemTime>,
+        ),
+        glide_core::iam::GlideIAMError,
+    > {
+        use std::sync::Arc as StdArc;
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<std::result::Result<JsAwsCredentials, String>>(1);
+        let tx = StdArc::new(tx);
+
+        let status = self.tsfn.call_with_return_value(
+            (),
+            ThreadsafeFunctionCallMode::Blocking,
+            move |result: Result<Unknown<'static>>, _env: Env| {
+                use napi::JsValue as NapiJsValue;
+
+                let unknown = match result {
+                    Ok(u) => u,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("GlideCredentialProvider JS error: {e}")));
+                        return Ok(());
+                    }
+                };
+
+                let val = unknown.value();
+
+                // Determine whether the JS callback returned a Promise or a plain value.
+                let mut is_promise = false;
+                // SAFETY: val.env / val.value are valid napi pointers on this JS thread.
+                let np_status =
+                    unsafe { napi::sys::napi_is_promise(val.env, val.value, &mut is_promise) };
+                if np_status != napi::sys::Status::napi_ok {
+                    let _ = tx.send(Err(format!(
+                        "napi_is_promise failed with status: {np_status:?}"
+                    )));
+                    return Ok(());
+                }
+
+                if is_promise {
+                    // The JS callback returned a Promise. Attach .then() and .catch()
+                    // handlers that forward the resolved value (or rejection) over the
+                    // mpsc channel.
+                    use napi::bindgen_prelude::{FromNapiValue, PromiseRaw};
+
+                    // SAFETY: we verified this is a Promise above.
+                    let promise_raw = unsafe {
+                        PromiseRaw::<JsAwsCredentials>::from_napi_value(val.env, val.value)
+                    };
+
+                    match promise_raw {
+                        Ok(pr) => {
+                            let tx_resolve = tx.clone();
+                            let tx_reject = tx.clone();
+
+                            // Attach .then() — fires when the Promise resolves
+                            let then_result = pr.then(move |ctx| {
+                                let _ = tx_resolve.send(Ok(ctx.value));
+                                Ok(())
+                            });
+
+                            match then_result {
+                                Ok(pr2) => {
+                                    // Attach .catch() — fires when the Promise rejects
+                                    let _ = pr2.catch(
+                                        move |ctx: napi::bindgen_prelude::CallbackContext<
+                                            Unknown<'_>,
+                                        >| {
+                                            // Try to extract a useful rejection message from the
+                                            // Promise rejection value.
+                                            let reason = ctx
+                                                .value
+                                                .coerce_to_string()
+                                                .and_then(|s| s.into_utf8())
+                                                .map(|s| s.as_str().unwrap_or("").to_string())
+                                                .unwrap_or_else(|_| {
+                                                    "GlideCredentialProvider Promise rejected"
+                                                        .to_string()
+                                                });
+                                            let _ = tx_reject.send(Err(reason));
+                                            Ok(())
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(format!(
+                                        "Failed to attach .then() to credential Promise: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!(
+                                "Failed to read GlideCredentialProvider Promise: {e}"
+                            )));
+                        }
+                    }
+                } else {
+                    // Synchronous return — deserialize the Unknown directly.
+                    use napi::bindgen_prelude::FromNapiValue;
+                    // SAFETY: val.env / val.value are valid napi pointers on this JS thread.
+                    let result = unsafe { JsAwsCredentials::from_napi_value(val.env, val.value) }
+                        .map_err(|e: napi::Error| e.to_string());
+                    let _ = tx.send(result);
+                }
+                Ok(())
+            },
+        );
+
+        if status != Status::Ok {
+            return Err(glide_core::iam::GlideIAMError::CredentialsError(format!(
+                "GlideCredentialProvider callback scheduling failed: {status:?}"
+            )));
+        }
+
+        let creds = rx
+            .recv_timeout(NODE_CREDENTIALS_CALLBACK_TIMEOUT)
+            .map_err(|error| {
+                glide_core::iam::GlideIAMError::CredentialsError(format!(
+                    "GlideCredentialProvider callback did not return within {:?}: {error}",
+                    NODE_CREDENTIALS_CALLBACK_TIMEOUT
+                ))
+            })?
+            .map_err(|error| {
+                glide_core::iam::GlideIAMError::CredentialsError(format!(
+                    "GlideCredentialProvider callback error: {error}"
+                ))
+            })?;
+
+        validate_and_convert_credentials(creds)
+    }
+}
+
+/// Register a JavaScript GlideCredentialProvider callback in the global registry.
+/// Returns the registry key (UUID) that must be set in the ConnectionRequest's
+/// `credential_provider_key` field so the socket listener can look it up.
+///
+/// The JS callback signature is: `() => AwsCredentials | Promise<AwsCredentials>`
+/// Both synchronous and Promise-returning (async) callbacks are supported.
+#[napi(js_name = "registerCredentialProvider")]
+pub fn register_credential_provider(
+    #[napi(ts_arg_type = "() => JsAwsCredentials | Promise<JsAwsCredentials>")] callback: Function<
+        '_,
+        (),
+        Unknown<'static>,
+    >,
+) -> Result<String> {
+    let tsfn = callback
+        .build_threadsafe_function::<()>()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .build_callback(|_ctx| Ok(()))?;
+    let provider = Arc::new(NodeCredentialsProvider { tsfn });
+    let key = uuid::Uuid::new_v4().to_string();
+    let credentials_fn: glide_core::iam::CredentialsProvider =
+        Arc::new(move || provider.get_credentials());
+    glide_core::credential_provider_registry::register(key.clone(), credentials_fn);
+    Ok(key)
+}
+
+/// Remove a credential provider from the global registry by key.
+#[napi(js_name = "removeCredentialProvider")]
+pub fn remove_credential_provider(key: String) {
+    glide_core::credential_provider_registry::remove(&key);
+}
+
 #[napi(js_name = "closeMonitorClient", ts_return_type = "Promise<void>")]
 pub fn close_monitor_client(env: &Env, handle_id: i64) -> Result<Object<'_>> {
     let (deferred, promise) = env.create_deferred()?;
@@ -2728,4 +3624,390 @@ pub fn close_monitor_client(env: &Env, handle_id: i64) -> Result<Object<'_>> {
         deferred.resolve(|_| Ok(()));
     });
     Ok(promise)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_iam() -> ConnectionRequest {
+        use glide_core::client::{AuthenticationInfo, IamAuthenticationConfig};
+        use glide_core::iam::ServiceType;
+
+        ConnectionRequest {
+            authentication_info: Some(AuthenticationInfo {
+                username: Some("iam-user".to_string()),
+                password: None,
+                iam_config: Some(IamAuthenticationConfig {
+                    cluster_name: "cluster".to_string(),
+                    region: "us-east-1".to_string(),
+                    service_type: ServiceType::ElastiCache,
+                    refresh_interval_seconds: None,
+                    credentials_provider: None,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn test_provider() -> glide_core::iam::CredentialsProvider {
+        Arc::new(|| Ok(("access".to_string(), "secret".to_string(), None, None)))
+    }
+
+    #[test]
+    fn uncommitted_provider_claim_restores_registry_entry() {
+        let key = uuid::Uuid::new_v4().to_string();
+        glide_core::credential_provider_registry::register(key.clone(), test_provider());
+        let mut request = request_with_iam();
+
+        let claim = claim_credential_provider(Some(key.clone()), &mut request)
+            .unwrap()
+            .unwrap();
+        assert!(glide_core::credential_provider_registry::get(&key).is_none());
+        drop(claim);
+        assert!(glide_core::credential_provider_registry::remove(&key).is_some());
+    }
+
+    #[test]
+    fn committed_provider_claim_does_not_restore_registry_entry() {
+        let key = uuid::Uuid::new_v4().to_string();
+        glide_core::credential_provider_registry::register(key.clone(), test_provider());
+        let mut request = request_with_iam();
+
+        let mut claim = claim_credential_provider(Some(key.clone()), &mut request)
+            .unwrap()
+            .unwrap();
+        claim.commit();
+        drop(claim);
+        assert!(glide_core::credential_provider_registry::get(&key).is_none());
+    }
+
+    fn provider_direct_test_handle(client_id: u64) -> GlideClientHandle {
+        provider_direct_test_handle_with_cleanup(
+            client_id,
+            Arc::new(ProviderDirectClientCleanup::new(client_id)),
+        )
+    }
+
+    fn provider_direct_test_handle_with_cleanup(
+        client_id: u64,
+        cleanup: Arc<ProviderDirectClientCleanup>,
+    ) -> GlideClientHandle {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel::<WorkerMessage>();
+        GlideClientHandle {
+            command_tx: Some(command_tx),
+            inflight_requests: Arc::new(AtomicIsize::new(1)),
+            response_buffer: Arc::new(ResponseBuffer::new()),
+            wake_callback: None,
+            client_id,
+            provider_cleanup: Some(cleanup),
+            closed: false,
+            #[cfg(feature = "testing_utilities")]
+            provider_handle_open: false,
+        }
+    }
+
+    fn provider_cleanup_test_synchronization() -> (
+        Arc<ProviderCleanupTestSynchronization>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<bool>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (winner_claimed_tx, winner_claimed_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_winner_tx, release_winner_rx) = std::sync::mpsc::sync_channel(0);
+        let (loser_observed_tx, loser_observed_rx) = std::sync::mpsc::sync_channel(0);
+        (
+            Arc::new(ProviderCleanupTestSynchronization {
+                winner_claimed: winner_claimed_tx,
+                release_winner: Mutex::new(release_winner_rx),
+                loser_observed_closing: loser_observed_tx,
+                pause_next_winner: AtomicBool::new(true),
+                signal_next_loser: AtomicBool::new(true),
+            }),
+            winner_claimed_rx,
+            release_winner_tx,
+            loser_observed_rx,
+        )
+    }
+
+    #[test]
+    fn provider_direct_cleanup_is_idempotent() {
+        let client_id = glide_core::pool::allocate_client_id();
+        let cleanup = ProviderDirectClientCleanup::new(client_id);
+
+        cleanup.unregister();
+        cleanup.unregister();
+
+        assert_eq!(cleanup.cleanup_count(), 1);
+    }
+
+    #[test]
+    fn provider_direct_cleanup_loser_waits_for_winner_side_effects() {
+        let client_id = glide_core::pool::allocate_client_id();
+        let (synchronization, winner_claimed_rx, release_winner_tx, loser_observed_rx) =
+            provider_cleanup_test_synchronization();
+        let cleanup = Arc::new(ProviderDirectClientCleanup::new_synchronized(
+            client_id,
+            synchronization,
+        ));
+        let (winner_done_tx, winner_done_rx) = std::sync::mpsc::channel();
+        let (loser_done_tx, loser_done_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let winner_cleanup = Arc::clone(&cleanup);
+            scope.spawn(move || {
+                winner_cleanup.unregister();
+                winner_done_tx.send(()).unwrap();
+            });
+            winner_claimed_rx.recv().unwrap();
+
+            let loser_cleanup = Arc::clone(&cleanup);
+            scope.spawn(move || {
+                loser_cleanup.unregister();
+                loser_done_tx.send(()).unwrap();
+            });
+            loser_observed_rx.recv().unwrap();
+
+            // The loser has definitely observed Closing, but cannot return while
+            // the winner is paused before unregister/counter side effects.
+            assert!(matches!(
+                loser_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(cleanup.cleanup_count(), 0);
+
+            release_winner_tx.send(false).unwrap();
+            winner_done_rx.recv().unwrap();
+            loser_done_rx.recv().unwrap();
+        });
+
+        // Completion of either caller implies all winner side effects are visible.
+        assert_eq!(cleanup.cleanup_count(), 1);
+        assert_eq!(
+            cleanup.state.load(Ordering::Acquire),
+            PROVIDER_CLEANUP_CLOSED
+        );
+        cleanup.unregister();
+        assert_eq!(cleanup.cleanup_count(), 1);
+    }
+
+    async fn lazy_client(request: ConnectionRequest) -> Client {
+        Client::new(
+            ConnectionRequest {
+                addresses: vec![NodeAddress {
+                    host: "127.0.0.1".to_string(),
+                    port: 1,
+                    unix_socket_path: None,
+                }],
+                lazy_connect: true,
+                ..request
+            },
+            None,
+        )
+        .await
+        .expect("lazy client construction must not connect")
+    }
+
+    #[tokio::test]
+    async fn provider_direct_handle_drop_unregisters_scope() {
+        let client_id = glide_core::pool::allocate_client_id();
+        let client = lazy_client(ConnectionRequest::default()).await;
+        glide_core::scope::register_client(client_id, client);
+
+        drop(provider_direct_test_handle(client_id));
+
+        assert!(glide_core::scope::get_parent_client(client_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_direct_close_then_drop_is_idempotent() {
+        let client_id = glide_core::pool::allocate_client_id();
+        let client = lazy_client(ConnectionRequest::default()).await;
+        glide_core::scope::register_client(client_id, client);
+        let mut handle = provider_direct_test_handle(client_id);
+        let cleanup = Arc::clone(
+            handle
+                .provider_cleanup
+                .as_ref()
+                .expect("provider test handle carries cleanup state"),
+        );
+
+        let pending_response = CommandResponse {
+            callback_idx: 0,
+            resp_pointer_high: None,
+            resp_pointer_low: None,
+            constant_response: Some("pending".to_string()),
+            request_error: None,
+            closing_error: None,
+            is_push: false,
+        };
+        assert!(handle.response_buffer.push(pending_response));
+
+        handle.close().unwrap();
+        assert!(handle.closed);
+        assert!(handle.command_tx.is_none());
+        assert!(handle.wake_callback.is_none());
+        assert!(handle.response_buffer.is_closed());
+        assert!(handle.response_buffer.responses.lock().is_empty());
+        assert!(glide_core::scope::get_parent_client(client_id).is_none());
+        assert_eq!(cleanup.cleanup_count(), 1);
+
+        // Repeated close and a later Drop are no-ops. A replacement registration
+        // proves neither path unregisters the same ID again.
+        handle.close().unwrap();
+        let replacement = lazy_client(ConnectionRequest::default()).await;
+        glide_core::scope::register_client(client_id, replacement);
+        drop(handle);
+        assert_eq!(cleanup.cleanup_count(), 1);
+        assert!(glide_core::scope::get_parent_client(client_id).is_some());
+        glide_core::scope::unregister_client(client_id);
+    }
+
+    #[tokio::test]
+    async fn provider_direct_close_for_pool_release_runs_full_cleanup_once() {
+        let client_id = glide_core::pool::allocate_client_id();
+        let client = lazy_client(ConnectionRequest::default()).await;
+        glide_core::scope::register_client(client_id, client);
+        let mut handle = provider_direct_test_handle(client_id);
+        let cleanup = Arc::clone(handle.provider_cleanup.as_ref().unwrap());
+
+        handle.close_for_pool_release().unwrap();
+
+        assert!(handle.closed);
+        assert!(handle.command_tx.is_none());
+        assert!(handle.wake_callback.is_none());
+        assert!(handle.response_buffer.is_closed());
+        assert!(glide_core::scope::get_parent_client(client_id).is_none());
+        assert_eq!(cleanup.cleanup_count(), 1);
+
+        handle.close_for_pool_release().unwrap();
+        drop(handle);
+        assert_eq!(cleanup.cleanup_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_direct_cleanup_panic_wakes_waiter_and_finalizer_retries() {
+        let client_id = glide_core::pool::allocate_client_id();
+        let client = lazy_client(ConnectionRequest::default()).await;
+        glide_core::scope::register_client(client_id, client);
+        let (synchronization, winner_claimed_rx, release_winner_tx, loser_observed_rx) =
+            provider_cleanup_test_synchronization();
+        let cleanup = Arc::new(ProviderDirectClientCleanup::new_synchronized(
+            client_id,
+            synchronization,
+        ));
+        let mut handle = provider_direct_test_handle_with_cleanup(client_id, Arc::clone(&cleanup));
+        let response_buffer = Arc::clone(&handle.response_buffer);
+        let pending_response = CommandResponse {
+            callback_idx: 0,
+            resp_pointer_high: None,
+            resp_pointer_low: None,
+            constant_response: Some("pending".to_string()),
+            request_error: None,
+            closing_error: None,
+            is_push: false,
+        };
+        assert!(response_buffer.push(pending_response));
+        let (loser_done_tx, loser_done_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let winner = scope.spawn(move || handle.close().unwrap());
+            winner_claimed_rx.recv().unwrap();
+
+            let loser_cleanup = Arc::clone(&cleanup);
+            scope.spawn(move || {
+                loser_cleanup.unregister();
+                loser_done_tx.send(()).unwrap();
+            });
+            loser_observed_rx.recv().unwrap();
+
+            assert_eq!(
+                cleanup.state.load(Ordering::Acquire),
+                PROVIDER_CLEANUP_CLOSING
+            );
+            assert_eq!(cleanup.cleanup_count(), 0);
+            release_winner_tx.send(true).unwrap();
+
+            // The winner unwinds, its transition guard restores Open, and either
+            // the waiting loser or the handle finalizer wins the retry.
+            loser_done_rx.recv().unwrap();
+            assert!(winner.join().is_err());
+        });
+
+        assert_eq!(
+            cleanup.state.load(Ordering::Acquire),
+            PROVIDER_CLEANUP_CLOSED
+        );
+        assert_eq!(cleanup.cleanup_count(), 1);
+        assert!(glide_core::scope::get_parent_client(client_id).is_none());
+        assert!(response_buffer.is_closed());
+        assert!(response_buffer.responses.lock().is_empty());
+        cleanup.unregister();
+        assert_eq!(cleanup.cleanup_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_direct_committed_claim_then_handle_drop_releases_ownership() {
+        let provider_lifetime = Arc::new(());
+        let provider_lifetime_weak = Arc::downgrade(&provider_lifetime);
+        let captured_lifetime = Arc::clone(&provider_lifetime);
+        let provider: glide_core::iam::CredentialsProvider = Arc::new(move || {
+            let _keep_provider_alive = &captured_lifetime;
+            Ok(("access".to_string(), "secret".to_string(), None, None))
+        });
+        drop(provider_lifetime);
+
+        let key = uuid::Uuid::new_v4().to_string();
+        glide_core::credential_provider_registry::register(key.clone(), provider);
+        let mut request = request_with_iam();
+        let mut claim = claim_credential_provider(Some(key.clone()), &mut request)
+            .unwrap()
+            .unwrap();
+        let client = lazy_client(request).await;
+        let client_id = glide_core::pool::allocate_client_id();
+        glide_core::scope::register_client(client_id, client.clone());
+        let handle = provider_direct_test_handle(client_id);
+
+        // Model the ownership transition after successful handle conversion:
+        // the registry claim stays consumed, while dropping the provider-only
+        // native marker releases the scope clone exactly once.
+        claim.commit();
+        drop(claim);
+        drop(client);
+        assert!(glide_core::credential_provider_registry::get(&key).is_none());
+        drop(handle);
+
+        assert!(glide_core::scope::get_parent_client(client_id).is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while provider_lifetime_weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client/provider ownership should be released after finalization");
+    }
+
+    fn push(kind: redis::PushKind) -> PushInfo {
+        PushInfo { kind, data: vec![] }
+    }
+
+    #[test]
+    fn disconnection_push_is_handled_natively() {
+        assert!(handle_disconnection_push(&push(
+            redis::PushKind::Disconnection
+        )));
+    }
+
+    #[test]
+    fn other_pushes_are_forwarded_to_js() {
+        for kind in [
+            redis::PushKind::Message,
+            redis::PushKind::PMessage,
+            redis::PushKind::SMessage,
+            redis::PushKind::Subscribe,
+            redis::PushKind::Invalidate,
+        ] {
+            assert!(!handle_disconnection_push(&push(kind)));
+        }
+    }
 }

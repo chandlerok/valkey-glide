@@ -74,8 +74,8 @@ enum ChosenAction {
 
 fn main() {
     let args = Args::parse();
-    logger_core::init(
-        Some(logger_core::Level::Warn),
+    glide_logger::init(
+        Some(glide_logger::Level::Warn),
         Path::new(&args.results_file)
             .file_stem()
             .and_then(|os_str| os_str.to_str()),
@@ -225,6 +225,7 @@ async fn get_connection(args: &Args) -> Client {
     let address_info: NodeAddress = NodeAddress {
         host: args.host.clone(),
         port: args.port as u16,
+        unix_socket_path: None,
     };
     let connection_request = ConnectionRequest {
         addresses: vec![address_info],

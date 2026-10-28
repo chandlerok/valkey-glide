@@ -28,6 +28,10 @@ EXCLUDED_TESTS = {
         "test_UDS_socket_connection_failure",
         "test_cancelled_request_handled_gracefully",
         "test_client_usable_after_cancelled_commands",
+        # Async-only: the sync client blocks in the FFI call and cannot abandon it
+        "test_abandoned_acquire_returns_its_slot",
+        # Async-only: the sync client has no event loop whose waiters could queue
+        "test_many_waiters_time_out_together",
         "test_connection_timeout_on_unavailable_host",
         "test_invalid_tls_config_fails_fast",
         "test_aclose_alias",
@@ -61,6 +65,7 @@ EXCLUDED_TESTS = {
         "poll_for_timestamp_change",
         # OpenTelemetry async helper function
         "wait_for_spans_to_be_flushed",
+        "assert_no_spans_exported",
         # Async-only lifecycle tests (pipe/event-loop specific)
         "test_concurrent_commands_from_multiple_clients",
         "test_response_after_client_close_is_managed",
@@ -96,6 +101,11 @@ EXCLUDED_TESTS = {
         # Abandon detection tests — async-only (monitor runs on tokio runtime)
         "test_pool_abandon_detection",
         "test_pool_abandon_detection_disabled",
+        # Async provider scheduling has no sync equivalent.
+        "test_iam_custom_async_provider_forms",
+        "test_iam_close_during_provider_refresh_does_not_block_owner_runtime",
+        # Coordinates both client kinds; a pure sync twin would not test coexistence.
+        "test_live_async_sync_provider_ids_coexist_without_registry_leaks",
     ],
     "sync_only": [
         "test_sync_fork",
@@ -135,6 +145,7 @@ EXCLUDED_TESTS_FILENAMES = {
         "test_client_side_cache.py",
         "test_async_freethreading.py",
         "test_fork_safety.py",
+        "test_async_scope_backends.py",
     ],
     "sync_only": [
         "test_sync_client_side_cache.py",

@@ -49,18 +49,19 @@ Valkey GLIDE is an official open-source client library for Valkey and Redis OSS.
 
 ## Project Structure
 
-```
+```text
+benchmarks/     # Performance benchmarks
+docs/           # Documentation
+examples/       # Usage examples for each language
+ffi/            # Foreign function interface for language bindings
 glide-core/     # Rust core driver - handles connection, protocol, clustering
-python/         # Python client wrapper
+glide-logger/    # Rust logging infrastructure
+glide-rdma/     # Rust RDMA transfer layer over libfabric
+go/             # Go client wrapper
 java/           # Java client wrapper
 node/           # Node.js client wrapper
-go/             # Go client wrapper
-ffi/            # Foreign function interface for language bindings
-logger_core/    # Rust logging infrastructure
+python/         # Python client wrapper
 utils/          # Test utilities and cluster management scripts
-benchmarks/     # Performance benchmarks
-examples/       # Usage examples for each language
-docs/           # Documentation
 ```
 
 ## Architecture: Language Bindings to Core
@@ -143,5 +144,12 @@ FFI wrappers → `glide-core` → Valkey/Redis
     <start-with>ffi/src/lib.rs</start-with>
     <entry>ffi/Cargo.toml</entry>
     <bindings>ffi/src/lib.rs</bindings>
+  </language>
+  <language name="rdma">
+    <triggers>rdma, libfabric, efa, glide-rdma</triggers>
+    <start-with>glide-rdma/src/lib.rs</start-with>
+    <entry>glide-rdma/Cargo.toml</entry>
+    <bindings>glide-rdma/glide-libfabric-sys/src/lib.rs</bindings>
+    <tests>glide-rdma/tests/</tests>
   </language>
 </context-sources>

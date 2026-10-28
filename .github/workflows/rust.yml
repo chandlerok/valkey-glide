@@ -1,0 +1,143 @@
+name: Rust client CI
+
+permissions:
+    contents: read
+
+on:
+    push:
+        branches:
+            - main
+            - release-*
+            - v*
+        paths:
+            - rust/**
+
+            # Rust dependencies
+            - glide-core/**
+            - glide-telemetry/**
+            - glide-logger/**
+            - deny.toml
+
+            # GitHub workflows
+            - .github/workflows/rust.yml
+            - .github/actions/install-engine/action.yml
+            - .github/actions/install-protoc/action.yml
+            - .github/actions/install-rust/action.yml
+            - .github/actions/install-shared-dependencies/action.yml
+            - .github/actions/install-zig/action.yml
+            - .github/workflows/lint-rust/action.yml
+            - utils/cluster_manager.py
+            - "!**/*.md"
+            - "!**/THIRD_PARTY_LICENSES*"
+            # Re-include: compiled as doctests by rust/src/lib.rs
+            - rust/README.md
+            - rust/migration.md
+    pull_request:
+        paths:
+            - rust/**
+
+            # Rust dependencies
+            - glide-core/**
+            - glide-telemetry/**
+            - glide-logger/**
+            - deny.toml
+
+            # GitHub workflows
+            - .github/workflows/rust.yml
+            - .github/actions/install-engine/action.yml
+            - .github/actions/install-protoc/action.yml
+            - .github/actions/install-rust/action.yml
+            - .github/actions/install-shared-dependencies/action.yml
+            - .github/actions/install-zig/action.yml
+            - .github/workflows/lint-rust/action.yml
+            - utils/cluster_manager.py
+            - "!**/*.md"
+            - "!**/THIRD_PARTY_LICENSES*"
+            # Re-include: compiled as doctests by rust/src/lib.rs
+            - rust/README.md
+            - rust/migration.md
+    workflow_dispatch:
+    workflow_call:
+
+concurrency:
+    group: rust-${{ github.head_ref || github.ref }}
+    cancel-in-progress: true
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    lint:
+        name: Lint - Rust client
+        runs-on: ubuntu-24.04
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - uses: ./.github/workflows/lint-rust
+              with:
+                  cargo-toml-folder: rust
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+              name: lint rust client
+
+    tests:
+        name: Test - ${{ matrix.engine.type }} ${{ matrix.engine.version }}, ${{ matrix.host.arch }}
+        runs-on: ${{ matrix.host.runner }}
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            # TODO #6997: Use the shared test matrix. The hosts are duplicated in rust-cd.yml.
+            matrix:
+                host:
+                    - arch: x64
+                      runner: ubuntu-24.04
+                      target: x86_64-unknown-linux-gnu
+                    - arch: arm64
+                      runner: ubuntu-24.04-arm
+                      target: aarch64-unknown-linux-gnu
+                engine:
+                    # TODO #7312: Bump to 9.2.0 once released
+                    - type: valkey
+                      version: "9.2.0-rc1"
+                    - type: redis
+                      version: "6.2"
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Determine minimum supported Rust version (MSRV)
+              id: msrv
+              working-directory: ./rust
+              shell: bash
+              run: |
+                  # Fetch from Cargo.toml (rust-version = "X.Y.Z").
+                  msrv=$(awk -F'"' '/^rust-version/ { print $2; exit }' Cargo.toml)
+                  if [ -z "$msrv" ]; then
+                      echo "::error::rust-version not found in rust/Cargo.toml"
+                      exit 1
+                  fi
+                  echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
+
+            - name: Install shared software dependencies
+              uses: ./.github/actions/install-shared-dependencies
+              with:
+                  os: ubuntu
+                  rust-toolchain: ${{ steps.msrv.outputs.toolchain }}
+                  target: ${{ matrix.host.target }}
+                  engine-version: ${{ matrix.engine.version }}
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Run unit tests
+              working-directory: ./rust
+              run: cargo unit-tests --locked -- --show-output
+
+            - name: Run doctests
+              working-directory: ./rust
+              run: cargo doc-tests --locked -- --show-output
+
+            - name: Run integration tests
+              working-directory: ./rust
+              run: cargo integration-tests --locked -- --show-output

@@ -223,6 +223,20 @@ class _GlideFFI:
                 size_t* resolved_host_len
             );
 
+            typedef uint8_t (*CredentialProviderCallback)(
+                uintptr_t client_id,
+                uint8_t* access_key_id_buf,
+                size_t access_key_id_buf_len,
+                size_t* access_key_id_len,
+                uint8_t* secret_access_key_buf,
+                size_t secret_access_key_buf_len,
+                size_t* secret_access_key_len,
+                uint8_t* session_token_buf,
+                size_t session_token_buf_len,
+                size_t* session_token_len,
+                int64_t* expires_at_epoch_millis
+            );
+
             typedef struct {
                 int _type;
                 union {
@@ -246,6 +260,15 @@ class _GlideFFI:
                 PubSubCallback pubsub_callback,
                 AddressResolverCallback address_resolver,
                 uintptr_t client_id
+            );
+            const ConnectionResponse* create_client_with_credential_provider(
+                const uint8_t* connection_request_bytes,
+                size_t connection_request_len,
+                const ClientType* client_type,
+                PubSubCallback pubsub_callback,
+                AddressResolverCallback address_resolver,
+                uintptr_t client_id,
+                CredentialProviderCallback credential_provider
             );
             void close_client(const void* client_adapter_ptr);
             void init_async_pipe(int pipe_write_fd);
@@ -363,6 +386,19 @@ class _GlideFFI:
             uint64_t create_batch_otel_span();
             uint64_t create_named_otel_span(const char* span_name);
             uint64_t create_otel_span_with_parent(int request_type, uint64_t parent_span_ptr);
+            uint64_t create_named_otel_span_with_trace_context(
+                const char* span_name,
+                const char* trace_id,
+                const char* span_id,
+                uint8_t trace_flags,
+                const char* trace_state
+            );
+            uint64_t create_batch_otel_span_with_trace_context(
+                const char* trace_id,
+                const char* span_id,
+                uint8_t trace_flags,
+                const char* trace_state
+            );
             void drop_otel_span(uint64_t span_ptr);
             const char* init_open_telemetry(const OpenTelemetryConfig* open_telemetry_config);
 
@@ -432,11 +468,23 @@ class _GlideFFI:
             );
 
             // ============== ISOLATED EXECUTION SCOPES ==============
-            int64_t glide_scope_try_acquire(
+            CommandResult* glide_scope_acquire_blocking(
                 uint64_t client_id,
                 const uint8_t* connection_request_ptr,
                 size_t connection_request_len,
-                uint16_t routing_slot
+                bool has_routing_slot,
+                uint16_t routing_slot,
+                uint64_t timeout_ms
+            );
+            int32_t glide_scope_acquire_pipe(
+                uint64_t client_id,
+                const uint8_t* connection_request_ptr,
+                size_t connection_request_len,
+                bool has_routing_slot,
+                uint16_t routing_slot,
+                uint64_t timeout_ms,
+                uintptr_t request_id,
+                uint64_t pipe_client_id
             );
             int32_t glide_scope_release(uint64_t scope_id, uint64_t client_id);
             CommandResult* glide_scope_execute(

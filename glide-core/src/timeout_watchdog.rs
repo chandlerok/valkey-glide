@@ -193,6 +193,7 @@ pub fn cmd_name_from_bytes(bytes: &[u8]) -> &'static str {
             &[
                 (b"CLUSTER", "CLUSTER"),
                 (b"COMMAND", "COMMAND"),
+                (b"DELIFEQ", "DELIFEQ"),
                 (b"DISCARD", "DISCARD"),
                 (b"EVALSHA", "EVALSHA"),
                 (b"FLUSHDB", "FLUSHDB"),
@@ -201,6 +202,7 @@ pub fn cmd_name_from_bytes(bytes: &[u8]) -> &'static str {
                 (b"HEXISTS", "HEXISTS"),
                 (b"HEXPIRE", "HEXPIRE"),
                 (b"HGETALL", "HGETALL"),
+                (b"HGETDEL", "HGETDEL"),
                 (b"HINCRBY", "HINCRBY"),
                 (b"HSTRLEN", "HSTRLEN"),
                 (b"LATENCY", "LATENCY"),
@@ -557,6 +559,9 @@ impl LatencyTracker {
         // Only update count while the ring is filling. Once full, count == capacity
         // and never changes again — skip the atomic RMW entirely.
         if self.count.load(Ordering::Relaxed) < self.capacity {
+            //TODO: (#7175) `fetch_update` is deprecated for `try_update` since Rust 1.99, but `try_update`
+            // needs 1.95 and the MSRV is 1.94.1.
+            #[allow(deprecated)]
             let _ = self
                 .count
                 .fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
@@ -1025,6 +1030,7 @@ mod tests {
     // ── Fork Safety (reinit) ─────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial]
     async fn reinit_global_spawns_new_working_watchdog() {
         // Ensure the global watchdog is initialized.
         let _pre = TimeoutWatchdog::global();

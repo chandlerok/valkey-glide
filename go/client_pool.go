@@ -19,6 +19,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const customCredentialProviderPoolError = "pool clients cannot use a custom IAM credentials provider; " +
+	"configure IAM without a credential provider to use the default AWS credential chain"
+
+var errCustomCredentialProviderPool = errors.New(customCredentialProviderPoolError)
+
 // PoolConfig holds configuration for a client-instance pool.
 type PoolConfig struct {
 	// Maximum number of clients in the pool. Default: 10.
@@ -109,11 +114,27 @@ func NewClientPool(clientConfig *config.ClientConfiguration, poolConfig PoolConf
 		poolConfig.AbandonTimeout = 0 // negative → disabled (FFI interprets 0ms as disabled)
 	}
 
+	if clientConfig.GetCredentialProvider() != nil {
+		return nil, errCustomCredentialProviderPool
+	}
+
 	// Reject pubsub subscriptions — pool state reset doesn't UNSUBSCRIBE
 	if clientConfig.HasSubscription() {
 		return nil, errors.New(
 			"pool clients cannot have pubsub subscriptions configured; " +
 				"use the main client's pubsub API instead",
+		)
+	}
+
+	// Reject a custom address resolver. It is a per-client callback registered
+	// with the core outside the serialized ConnectionRequest; glide_pool_create
+	// takes only the bytes, so the pool cannot forward it. The probe below runs
+	// a real client and can pass, but pooled connections would then use the
+	// untranslated address and fail at runtime — so fail fast here instead.
+	if clientConfig.GetAddressResolver() != nil {
+		return nil, errors.New(
+			"pool clients cannot use a custom address resolver; " +
+				"resolve addresses before configuring the pool",
 		)
 	}
 
@@ -328,11 +349,27 @@ func NewClusterClientPool(clientConfig *config.ClusterClientConfiguration, poolC
 		poolConfig.AbandonTimeout = 0 // negative → disabled (FFI interprets 0ms as disabled)
 	}
 
+	if clientConfig.GetCredentialProvider() != nil {
+		return nil, errCustomCredentialProviderPool
+	}
+
 	// Reject pubsub subscriptions — pool state reset doesn't UNSUBSCRIBE
 	if clientConfig.HasSubscription() {
 		return nil, errors.New(
 			"pool clients cannot have pubsub subscriptions configured; " +
 				"use the main client's pubsub API instead",
+		)
+	}
+
+	// Reject a custom address resolver. It is a per-client callback registered
+	// with the core outside the serialized ConnectionRequest; glide_pool_create
+	// takes only the bytes, so the pool cannot forward it. The probe below runs
+	// a real client and can pass, but pooled connections would then use the
+	// untranslated address and fail at runtime — so fail fast here instead.
+	if clientConfig.GetAddressResolver() != nil {
+		return nil, errors.New(
+			"pool clients cannot use a custom address resolver; " +
+				"resolve addresses before configuring the pool",
 		)
 	}
 

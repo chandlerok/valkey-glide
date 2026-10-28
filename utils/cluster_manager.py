@@ -3,6 +3,7 @@
 # Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 import argparse
+
 try:
     import fcntl  # POSIX only — not available on Windows
 except ImportError:
@@ -12,6 +13,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import signal
 import socket
 import string
@@ -389,6 +391,65 @@ def create_cluster_folder(path: str, prefix: str) -> str:
     return cluster_folder
 
 
+def get_bind_addresses(host: str) -> List[str]:
+    """
+    Returns the addresses a server should bind to for the given host.
+
+    Loopback hosts bind to both the IPv4 and IPv6 loopback addresses. Any other
+    host binds to its resolved addresses plus the IPv4 loopback, so that local
+    and remote clients can connect.
+
+    Args:
+        host (str): The host the server is started with.
+
+    Returns:
+        List[str]: The unique addresses to pass to `--bind`.
+    """
+    if host in (DEFAULT_HOST_IPV4, DEFAULT_HOST_IPV6, "localhost"):
+        return [DEFAULT_HOST_IPV4, DEFAULT_HOST_IPV6]
+
+    try:
+        addr_infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        resolved = [str(addr_info[4][0]) for addr_info in addr_infos]
+    except socket.gaierror:
+        logging.warning(f"Could not resolve host {host}; binding it as given")
+        resolved = [host]
+
+    # Remove duplicates because binding the same address
+    # twice makes the server fail with "Address already in use".
+    return list(dict.fromkeys(resolved + [DEFAULT_HOST_IPV4]))
+
+
+def build_loadmodule_args(module_path: str) -> List[str]:
+    """Build the ``--loadmodule`` argv for one ``--load-module`` entry.
+
+    Valkey's module loader requires each trailing config arg (e.g.
+    ``--emulate-release 1.3.0``) to be its own argv token starting with
+    ``--``, not one combined string -- confirmed via valkey_search
+    1.3.0-rc1. Only a trailing ``--...`` config suffix, if present, is
+    split into separate tokens; a plain module path (the common case, and
+    the only case when no config suffix is given) is passed through
+    unchanged.
+
+    Splitting every path through ``shlex.split`` unconditionally, even
+    when there is no config suffix to split out, is wrong: ``shlex.split``
+    tokenizes its input as shell syntax, so a path containing a single
+    apostrophe (e.g. a directory named after a user called ``o'brien``,
+    legal on both Linux and macOS) raises ``ValueError: No closing
+    quotation`` even though nothing needed splitting. A module path is
+    only run through ``shlex.split`` when it actually contains a trailing
+    ``--`` config token to isolate -- detected by a literal, un-tokenized
+    search for ``" --"`` in the path, so a plain path is never shell-
+    tokenized at all, apostrophes included.
+    """
+    config_start = module_path.find(" --")
+    if config_start == -1:
+        return [module_path]
+    path_part = module_path[:config_start]
+    config_part = module_path[config_start:]
+    return [path_part, *shlex.split(config_part)]
+
+
 def start_server(
     host: str,
     port: Optional[int],
@@ -397,6 +458,7 @@ def start_server(
     tls_args: List[str],
     cluster_mode: bool,
     load_module: Optional[List[str]] = None,
+    cluster_node_timeout: Optional[int] = None,
 ) -> Tuple[Server, str]:
     port = port if port else next_free_port()
     logging.debug(f"Creating server {host}:{port}")
@@ -441,18 +503,20 @@ def start_server(
         "no",
         "--save",
         "",
+        # Start a replica's full sync as soon as it asks. The default 5s delay
+        # batches replicas to save forks on large datasets; test clusters have
+        # one replica per shard and an empty dataset, so the delay is pure wait.
+        "--repl-diskless-sync-delay",
+        "0",
     ]
 
-    # Bind server to the specified host. If host is not localhost, bind to both
-    # the private IP and loopback so local and remote clients can connect.
-    if host not in (DEFAULT_HOST_IPV4, DEFAULT_HOST_IPV6, "localhost"):
-        cmd_args.extend(["--bind", host, DEFAULT_HOST_IPV4])
-    else:
-        cmd_args.extend(["--bind", DEFAULT_HOST_IPV4, DEFAULT_HOST_IPV6])
+    cmd_args.extend(["--bind", *get_bind_addresses(host)])
 
     # If host is a DNS hostname, set cluster-announce-hostname so
     # the cluster topology reports DNS names instead of IP addresses.
     if cluster_mode:
+        if cluster_node_timeout is not None:
+            cmd_args.extend(["--cluster-node-timeout", str(cluster_node_timeout)])
         try:
             import ipaddress
             ipaddress.ip_address(host)
@@ -470,7 +534,7 @@ def start_server(
                 "Please provide the path(s) to the module(s) you want to load."
             )
         for module_path in load_module:
-            cmd_args.extend(["--loadmodule", module_path])
+            cmd_args.extend(["--loadmodule", *build_loadmodule_args(module_path)])
     cmd_args += tls_args
     p = subprocess.Popen(
         cmd_args,
@@ -511,6 +575,7 @@ def create_servers(
     tls_key_file: Optional[str] = None,
     tls_ca_cert_file: Optional[str] = None,
     tls_auth_clients: bool = False,
+    cluster_node_timeout: Optional[int] = None,
 ) -> List[Server]:
     tic = time.perf_counter()
     logging.debug("## Creating servers")
@@ -558,7 +623,14 @@ def create_servers(
         port = ports[i] if ports else None
         servers_to_check.add(
             start_server(
-                host, port, cluster_folder, tls, tls_args, cluster_mode, load_module
+                host,
+                port,
+                cluster_folder,
+                tls,
+                tls_args,
+                cluster_mode,
+                load_module,
+                cluster_node_timeout,
             )
         )
     # Check all servers
@@ -582,6 +654,7 @@ def create_servers(
                     tls_args,
                     cluster_mode,
                     load_module,
+                    cluster_node_timeout,
                 )
             )
             continue
@@ -1388,7 +1461,23 @@ def main():
     parser_start.add_argument(
         "--load-module",
         action="append",
-        help="The paths of the server modules to load.",
+        help="The path of a server module to load. Use multiple times for "
+        "multiple modules. May include trailing module config args as one "
+        "space-separated string, e.g. "
+        "'/path/libsearch.dylib --emulate-release 1.3.0' or "
+        "'/path/libsearch.dylib --use-coordinator yes' -- each arg must "
+        "start with '--' (Valkey module-loader requirement) and is split "
+        "into its own argv token before exec.",
+        required=False,
+    )
+
+    parser_start.add_argument(
+        "--cluster-node-timeout",
+        type=int,
+        help="cluster-node-timeout (ms) for cluster-mode nodes. Defaults to the "
+        "server default (15000). Must exceed the longest Lua script a test suite "
+        "runs: a node busy in a script cannot answer cluster-bus pings, and its "
+        "replica is promoted once the timeout elapses.",
         required=False,
     )
 
@@ -1593,6 +1682,8 @@ def main():
             ]
             if args.cluster_mode:
                 cm_args.append("--cluster-mode")
+            if args.cluster_node_timeout is not None:
+                cm_args += ["--cluster-node-timeout", str(args.cluster_node_timeout)]
             if args.ports:
                 # Explicit ports requested - pass them through
                 cm_args += ["-p"] + [str(p) for p in args.ports]
@@ -1648,6 +1739,7 @@ def main():
                 getattr(args, 'tls_key_file', None),
                 getattr(args, 'tls_ca_cert_file', None),
                 getattr(args, 'tls_auth_clients', False),
+                args.cluster_node_timeout,
             )
             if args.cluster_mode:
                 # Create a cluster

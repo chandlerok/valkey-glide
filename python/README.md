@@ -174,6 +174,36 @@ test_standalone_client()
 
 ---
 
+### Unix Domain Socket
+
+Standalone clients can connect through the server's `unixsocket` instead of TCP. Cluster mode and TLS are not supported.
+
+```python
+import asyncio
+from glide import GlideClientConfiguration, NodeAddress, GlideClient
+
+async def test_unix_socket_client():
+    config = GlideClientConfiguration(
+        [NodeAddress(unix_socket_path="/run/valkey/valkey.sock")]
+    )
+    client = await GlideClient.create(config)
+    print(await client.ping())
+
+asyncio.run(test_unix_socket_client())
+```
+
+```python
+from glide_sync import GlideClientConfiguration, NodeAddress, GlideClient
+
+config = GlideClientConfiguration(
+    [NodeAddress(unix_socket_path="/run/valkey/valkey.sock")]
+)
+client = GlideClient.create(config)
+print(client.ping())
+```
+
+---
+
 ## PubSub Configuration
 
 Valkey GLIDE supports dynamic PubSub with automatic subscription reconciliation. Configure the reconciliation interval to ensure subscriptions remain synchronized:
@@ -352,6 +382,83 @@ current_rate = OpenTelemetry.get_sample_percentage()
 
 **Note**: OpenTelemetry can only be initialized once per process. To change configuration, restart your application.
 
+### Trace Context Propagation
+
+Trace context propagation is disabled by default. Set `enable_trace_context_propagation=True` to use the active application span as the parent of sampled GLIDE spans. GLIDE's default `sample_percentage=1` selects about 1% of commands even inside a sampled parent, set it to `100` when every command span should join the application trace. The active span is picked up through Python's `contextvars`, so no context argument is needed for sync, `asyncio` or `trio` commands.
+
+GLIDE only needs the optional `opentelemetry-api>=1.6.0` package to read the active span. The following example also uses your application's OpenTelemetry SDK and OTLP/HTTP exporter. With the API package alone, there is no recording provider and therefore no valid parent span.
+
+Install the API through the `otel` extra for the client you use:
+
+```bash
+pip install "valkey-glide[otel]"       # async client
+pip install "valkey-glide-sync[otel]"  # sync client
+```
+
+```bash
+pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+```
+
+With a Valkey server on `localhost:6379` and an OTLP/HTTP collector on `localhost:4318`, this example exports both sides of the trace to the same collector:
+
+```python
+import asyncio
+
+from glide import (
+    GlideClient, GlideClientConfiguration, NodeAddress,
+    OpenTelemetry, OpenTelemetryConfig, OpenTelemetryTracesConfig,
+)
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+traces_endpoint = "http://localhost:4318/v1/traces"
+
+# Application spans use the application's SDK exporter.
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=traces_endpoint)))
+trace.set_tracer_provider(provider)
+
+# GLIDE spans use GLIDE's separate exporter at the same OTLP/HTTP endpoint.
+OpenTelemetry.init(OpenTelemetryConfig(
+    traces=OpenTelemetryTracesConfig(
+        endpoint=traces_endpoint,
+        sample_percentage=100,
+        enable_trace_context_propagation=True,
+    ),
+    flush_interval_ms=1000,
+))
+
+async def main():
+    client = await GlideClient.create(GlideClientConfiguration(
+        addresses=[NodeAddress("localhost", 6379)],
+    ))
+    try:
+        with trace.get_tracer(__name__).start_as_current_span("checkout"):
+            await client.set("cart:42", "value")
+            await client.get("cart:42")
+    finally:
+        await client.close()
+        provider.force_flush()
+        await asyncio.sleep(2)  # Allow GLIDE's exporter to flush before exit.
+
+asyncio.run(main())
+```
+
+#### Where GLIDE's Spans Are Exported
+
+GLIDE exports its spans through the `endpoint` given to `OpenTelemetryTracesConfig`. Your application exports the parent through its own SDK. They share a trace ID but travel as separate streams. If the endpoints feed different backends or either exporter drops a span, the backend can show a parent without its GLIDE child or a child with a dangling `parent_span_id`. GLIDE cannot detect this from the command response. Point both exporters at the same collector and check both pipelines when a joined trace is missing.
+
+#### Sampling and the Parent Span
+
+- **Propagation is enabled and a valid parent span is active**: `sample_percentage` decides whether GLIDE creates a child span. At `0`, no GLIDE span is created. When a span is selected, it uses the active span as its parent. The parent's sampled flag then controls whether the Rust OpenTelemetry SDK exports the child. An unsampled parent produces no exported GLIDE child spans, even when `sample_percentage` is `100`.
+- **Propagation is disabled or no valid parent span is active**: `sample_percentage` decides whether GLIDE creates an independent trace root.
+
+#### Without `opentelemetry-api`
+
+The package is optional and only needed when `enable_trace_context_propagation=True`. Without it installed, propagation is off and GLIDE spans behave as they always have: independent trace roots governed by `sample_percentage` alone. If reading the active span context ever fails, it never fails your command. GLIDE logs each failure at debug level and continues as if no span were active, leaving `sample_percentage` to decide.
+
 ---
 
 ## Compression Configuration (EXPERIMENTAL)
@@ -360,8 +467,10 @@ current_rate = OpenTelemetry.get_sample_percentage()
 
 Valkey GLIDE supports automatic compression and decompression of string values to reduce memory usage and network bandwidth.
 
-**Incompatible Commands**: Compression is NOT compatible with commands that manipulate string data on the server:
-- APPEND, GETRANGE, SETRANGE, STRLEN, LCS
+**Incompatible Commands**: Compression is NOT compatible with commands that manipulate or compare string data on the server:
+
+- APPEND, GETRANGE, SETRANGE, STRLEN, LCS, SUBSTR
+- DELIFEQ and SET with IFEQ or IFNE
 - INCR, INCRBY, INCRBYFLOAT, DECR, DECRBY
 - GETBIT, SETBIT, BITCOUNT, BITPOS, BITFIELD, BITFIELD_RO, BITOP
 

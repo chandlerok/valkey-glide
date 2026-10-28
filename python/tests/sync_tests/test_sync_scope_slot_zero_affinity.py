@@ -7,23 +7,16 @@ import uuid
 
 import pytest
 from glide_shared.routes import SlotIdRoute, SlotType
-from glide_sync import GlideClusterClient, GlideClusterClientConfiguration
+from glide_sync import (
+    GlideClusterClient,
+    GlideClusterClientConfiguration,
+)
 
-from tests.utils.utils import get_cluster_addresses
+from tests.utils.utils import require_cluster_addresses
 
 CLUSTER_SLOT_COUNT = 16_384
 # Bound routed topology probes while sampling enough tags to find another primary.
 MAX_OTHER_PRIMARY_CANDIDATES = 512
-
-
-def _skip_cluster_if_unavailable():
-    """Skip test if no cluster endpoints are configured."""
-    try:
-        cluster = pytest.valkey_cluster  # type: ignore[attr-defined]
-        if cluster is None or len(cluster.nodes_addr) == 0:
-            pytest.skip("No cluster endpoints available")
-    except AttributeError:
-        pytest.skip("No cluster endpoints available (pytest.valkey_cluster not set)")
 
 
 def _slot_for_tag(tag: str) -> int:
@@ -59,12 +52,11 @@ def _keys_on_slot_zero_and_another_primary(
 @pytest.mark.parametrize("slot_zero_first", [True, False])
 def test_sync_scope_slot_zero_affinity_cluster(slot_zero_first):
     """Slot zero never reuses a scope targeting another cluster primary."""
-    # get_cluster_addresses() falls back to localhost:7000, so without this guard a
-    # standalone-only run fails on a refused connection instead of skipping. The
-    # collection hook cannot rescue it: this test parameterizes on slot_zero_first
-    # rather than cluster_mode.
-    _skip_cluster_if_unavailable()
-    addresses = get_cluster_addresses()
+    # require_cluster_addresses() skips when no cluster is configured, so a
+    # standalone-only run skips instead of failing on a refused connection. The
+    # collection hook cannot rescue it: it only acts on tests parameterized on
+    # cluster_mode, and only when external endpoints are passed.
+    addresses = require_cluster_addresses()
 
     client = GlideClusterClient.create(
         GlideClusterClientConfiguration(addresses=addresses, request_timeout=5000)
@@ -88,5 +80,39 @@ def test_sync_scope_slot_zero_affinity_cluster(slot_zero_first):
             assert scope.get(second_key) == "second"
 
         client.delete([slot_zero_key, other_primary_key])
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("cluster_mode", [True])
+def test_sync_scope_first_command_must_match_acquisition_slot(cluster_mode):
+    """A scope's very first command must hash to its acquisition slot.
+
+    The scope is acquired for slot A via routing_key, then its first keyed
+    command targets slot B on another primary. This must fail locally with a
+    cross-slot error before dispatch, not reach the server as a MOVED.
+
+    Lives in this module (rather than the modifiers suite) because it reuses the
+    ``_keys_on_slot_zero_and_another_primary`` helper, not because it is about
+    slot-0 affinity specifically.
+    """
+    addresses = require_cluster_addresses()
+
+    client = GlideClusterClient.create(
+        GlideClusterClientConfiguration(addresses=addresses, request_timeout=5000)
+    )
+    try:
+        acquisition_key, other_primary_key = _keys_on_slot_zero_and_another_primary(
+            client
+        )
+
+        with client.scoped_connection(routing_key=acquisition_key) as scope:
+            with pytest.raises(RuntimeError, match="(?i)cross.?slot"):
+                scope.set(other_primary_key, "wrong-slot")
+            # The scope stays usable for its acquisition slot.
+            assert scope.set(acquisition_key, "right-slot") is not None
+            assert scope.get(acquisition_key) == "right-slot"
+
+        client.delete([acquisition_key])
     finally:
         client.close()

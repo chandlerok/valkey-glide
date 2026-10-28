@@ -1,11 +1,15 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 //! Bitmap commands. Mirrors Python's bitmap command surface.
 
-use crate::error::Result;
+use crate::ValkeyResult;
+use crate::cmd::cmd;
 use crate::executor::CommandExecutor;
-use crate::value;
+use crate::value::FromValkeyValue;
+use crate::value::ValkeyValue;
+use crate::write::ToSingleValkeyArg;
+use crate::write::ToValkeyArgs;
+use crate::write::ValkeyWrite;
 use async_trait::async_trait;
-use redis::{Cmd, ToRedisArgs};
 
 /// Index unit for `BITCOUNT`/`BITPOS` range queries.
 ///
@@ -18,14 +22,16 @@ pub enum BitmapIndexType {
     Bit,
 }
 
-impl BitmapIndexType {
-    fn as_arg(&self) -> &'static str {
-        match self {
-            BitmapIndexType::Byte => "BYTE",
-            BitmapIndexType::Bit => "BIT",
-        }
+impl ToValkeyArgs for BitmapIndexType {
+    fn write_valkey_args<W: ?Sized + ValkeyWrite>(&self, out: &mut W) {
+        out.write_arg(match self {
+            BitmapIndexType::Byte => b"BYTE".as_slice(),
+            BitmapIndexType::Bit => b"BIT".as_slice(),
+        });
     }
 }
+
+impl ToSingleValkeyArg for BitmapIndexType {}
 
 /// A signed or unsigned bit encoding for `BITFIELD`/`BITFIELD_RO`.
 ///
@@ -38,14 +44,16 @@ pub enum BitEncoding {
     Unsigned(u32),
 }
 
-impl BitEncoding {
-    fn to_arg(self) -> String {
+impl ToValkeyArgs for BitEncoding {
+    fn write_valkey_args<W: ?Sized + ValkeyWrite>(&self, out: &mut W) {
         match self {
-            BitEncoding::Signed(n) => format!("i{n}"),
-            BitEncoding::Unsigned(n) => format!("u{n}"),
+            BitEncoding::Signed(n) => out.write_arg_fmt(format_args!("i{n}")),
+            BitEncoding::Unsigned(n) => out.write_arg_fmt(format_args!("u{n}")),
         }
     }
 }
+
+impl ToSingleValkeyArg for BitEncoding {}
 
 /// A bit offset for `BITFIELD`/`BITFIELD_RO`.
 ///
@@ -58,14 +66,16 @@ pub enum BitFieldOffset {
     Multiplier(u64),
 }
 
-impl BitFieldOffset {
-    fn to_arg(self) -> String {
+impl ToValkeyArgs for BitFieldOffset {
+    fn write_valkey_args<W: ?Sized + ValkeyWrite>(&self, out: &mut W) {
         match self {
-            BitFieldOffset::Bit(n) => n.to_string(),
-            BitFieldOffset::Multiplier(n) => format!("#{n}"),
+            BitFieldOffset::Bit(n) => out.write_arg_fmt(n),
+            BitFieldOffset::Multiplier(n) => out.write_arg_fmt(format_args!("#{n}")),
         }
     }
 }
+
+impl ToSingleValkeyArg for BitFieldOffset {}
 
 /// Overflow behavior for `BITFIELD` `SET`/`INCRBY` subcommands.
 ///
@@ -80,15 +90,17 @@ pub enum BitOverflow {
     Fail,
 }
 
-impl BitOverflow {
-    fn as_arg(&self) -> &'static str {
-        match self {
-            BitOverflow::Wrap => "WRAP",
-            BitOverflow::Sat => "SAT",
-            BitOverflow::Fail => "FAIL",
-        }
+impl ToValkeyArgs for BitOverflow {
+    fn write_valkey_args<W: ?Sized + ValkeyWrite>(&self, out: &mut W) {
+        out.write_arg(match self {
+            BitOverflow::Wrap => b"WRAP".as_slice(),
+            BitOverflow::Sat => b"SAT".as_slice(),
+            BitOverflow::Fail => b"FAIL".as_slice(),
+        });
     }
 }
+
+impl ToSingleValkeyArg for BitOverflow {}
 
 /// A subcommand for `BITFIELD`/`BITFIELD_RO`.
 ///
@@ -124,34 +136,37 @@ pub enum BitFieldSubcommand {
     Overflow(BitOverflow),
 }
 
-impl BitFieldSubcommand {
-    fn add_to(&self, cmd: &mut Cmd) {
+impl ToValkeyArgs for BitFieldSubcommand {
+    fn write_valkey_args<W: ?Sized + ValkeyWrite>(&self, out: &mut W) {
         match self {
             BitFieldSubcommand::Get { encoding, offset } => {
-                cmd.arg("GET").arg(encoding.to_arg()).arg(offset.to_arg());
+                out.write_arg(b"GET");
+                encoding.write_valkey_args(out);
+                offset.write_valkey_args(out);
             }
             BitFieldSubcommand::Set {
                 encoding,
                 offset,
                 value,
             } => {
-                cmd.arg("SET")
-                    .arg(encoding.to_arg())
-                    .arg(offset.to_arg())
-                    .arg(value);
+                out.write_arg(b"SET");
+                encoding.write_valkey_args(out);
+                offset.write_valkey_args(out);
+                value.write_valkey_args(out);
             }
             BitFieldSubcommand::IncrBy {
                 encoding,
                 offset,
                 increment,
             } => {
-                cmd.arg("INCRBY")
-                    .arg(encoding.to_arg())
-                    .arg(offset.to_arg())
-                    .arg(increment);
+                out.write_arg(b"INCRBY");
+                encoding.write_valkey_args(out);
+                offset.write_valkey_args(out);
+                increment.write_valkey_args(out);
             }
-            BitFieldSubcommand::Overflow(o) => {
-                cmd.arg("OVERFLOW").arg(o.as_arg());
+            BitFieldSubcommand::Overflow(overflow) => {
+                out.write_arg(b"OVERFLOW");
+                overflow.write_valkey_args(out);
             }
         }
     }
@@ -160,58 +175,53 @@ impl BitFieldSubcommand {
 /// Bitmap commands (`SETBIT`, `GETBIT`, `BITCOUNT`, `BITPOS`, `BITOP`).
 #[async_trait]
 pub trait BitmapCommands: CommandExecutor {
+    // TODO #7082: add a `bitcount` variant that takes the `BYTE`/`BIT` index unit
+    // (the `BitmapIndexType` type already exists), to match the other GLIDE clients.
+
     /// Find the position of the first bit set to `bit` (`BITPOS`).
-    async fn bitpos<K: ToRedisArgs + Send>(&self, key: K, bit: u8) -> Result<i64> {
-        let mut cmd = Cmd::new();
-        cmd.arg("BITPOS").arg(key).arg(bit);
-        value::to_i64(self.execute_command(cmd, None).await?)
+    async fn bitpos<K: ToValkeyArgs + Send>(&self, key: K, bit: u8) -> ValkeyResult<i64> {
+        let cmd = cmd("BITPOS").with_arg(key).with_arg(bit);
+        i64::from_owned_valkey_value(self.execute_command(cmd, None).await?)
     }
 
     /// Find the position of the first bit set to `bit` within a range
     /// (`BITPOS key bit start end [BYTE|BIT]`).
-    async fn bitpos_range<K: ToRedisArgs + Send>(
+    async fn bitpos_range<K: ToValkeyArgs + Send>(
         &self,
         key: K,
         bit: u8,
         start: i64,
         end: i64,
         index_type: Option<BitmapIndexType>,
-    ) -> Result<i64> {
-        let mut cmd = Cmd::new();
-        cmd.arg("BITPOS").arg(key).arg(bit).arg(start).arg(end);
-        if let Some(it) = index_type {
-            cmd.arg(it.as_arg());
-        }
-        value::to_i64(self.execute_command(cmd, None).await?)
+    ) -> ValkeyResult<i64> {
+        let cmd = cmd("BITPOS")
+            .with_arg(key)
+            .with_arg(bit)
+            .with_arg(start)
+            .with_arg(end)
+            .with_arg(index_type);
+        i64::from_owned_valkey_value(self.execute_command(cmd, None).await?)
     }
 
     /// Perform arbitrary bit-field operations (`BITFIELD`). Returns one result
     /// per non-`OVERFLOW` subcommand; a `None` indicates a `FAIL` overflow.
-    async fn bitfield<K: ToRedisArgs + Send>(
+    async fn bitfield<K: ToValkeyArgs + Send>(
         &self,
         key: K,
         subcommands: &[BitFieldSubcommand],
-    ) -> Result<Vec<Option<i64>>> {
-        let mut cmd = Cmd::new();
-        cmd.arg("BITFIELD").arg(key);
-        for sub in subcommands {
-            sub.add_to(&mut cmd);
-        }
+    ) -> ValkeyResult<Vec<Option<i64>>> {
+        let cmd = cmd("BITFIELD").with_arg(key).with_arg(subcommands);
         parse_bitfield(self.execute_command(cmd, None).await?)
     }
 
     /// Read-only bit-field operations (`BITFIELD_RO`). Only `GET` subcommands are
     /// permitted by the server.
-    async fn bitfield_readonly<K: ToRedisArgs + Send>(
+    async fn bitfield_readonly<K: ToValkeyArgs + Send>(
         &self,
         key: K,
         subcommands: &[BitFieldSubcommand],
-    ) -> Result<Vec<Option<i64>>> {
-        let mut cmd = Cmd::new();
-        cmd.arg("BITFIELD_RO").arg(key);
-        for sub in subcommands {
-            sub.add_to(&mut cmd);
-        }
+    ) -> ValkeyResult<Vec<Option<i64>>> {
+        let cmd = cmd("BITFIELD_RO").with_arg(key).with_arg(subcommands);
         parse_bitfield(self.execute_command(cmd, None).await?)
     }
 }
@@ -219,77 +229,80 @@ pub trait BitmapCommands: CommandExecutor {
 impl<T: CommandExecutor + ?Sized> BitmapCommands for T {}
 
 /// Parse a `BITFIELD` reply (array of ints, with `Nil` for `FAIL` overflow).
-fn parse_bitfield(v: redis::Value) -> Result<Vec<Option<i64>>> {
+fn parse_bitfield(v: ValkeyValue) -> ValkeyResult<Vec<Option<i64>>> {
     match v {
-        redis::Value::Nil => Ok(Vec::new()),
-        redis::Value::Array(items) => items
+        ValkeyValue::Nil => Ok(Vec::new()),
+        ValkeyValue::Array(items) => items
             .into_iter()
             .map(|it| match it {
-                redis::Value::Nil => Ok(None),
-                other => Ok(Some(value::to_i64(other)?)),
+                ValkeyValue::Nil => Ok(None),
+                other => Ok(Some(i64::from_owned_valkey_value(other)?)),
             })
             .collect(),
-        other => Ok(vec![Some(value::to_i64(other)?)]),
+        other => Ok(vec![Some(i64::from_owned_valkey_value(other)?)]),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assert_args;
 
-    fn args_of(cmd: &Cmd) -> Vec<String> {
-        cmd.args_iter()
-            .filter_map(|a| match a {
-                redis::Arg::Simple(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-                redis::Arg::Cursor => None,
-            })
-            .collect()
+    #[test]
+    fn index_type_args() {
+        assert_args(BitmapIndexType::Byte, &["BYTE"]);
+        assert_args(BitmapIndexType::Bit, &["BIT"]);
     }
 
     #[test]
     fn encoding_and_offset_args() {
-        assert_eq!(BitEncoding::Signed(8).to_arg(), "i8");
-        assert_eq!(BitEncoding::Unsigned(16).to_arg(), "u16");
-        assert_eq!(BitFieldOffset::Bit(5).to_arg(), "5");
-        assert_eq!(BitFieldOffset::Multiplier(3).to_arg(), "#3");
+        assert_args(BitEncoding::Signed(8), &["i8"]);
+        assert_args(BitEncoding::Unsigned(16), &["u16"]);
+        assert_args(BitFieldOffset::Bit(5), &["5"]);
+        assert_args(BitFieldOffset::Multiplier(3), &["#3"]);
+    }
+
+    #[test]
+    fn overflow_args() {
+        assert_args(BitOverflow::Wrap, &["WRAP"]);
+        assert_args(BitOverflow::Sat, &["SAT"]);
+        assert_args(BitOverflow::Fail, &["FAIL"]);
     }
 
     #[test]
     fn bitfield_subcommand_args() {
-        let mut cmd = Cmd::new();
-        BitFieldSubcommand::Get {
-            encoding: BitEncoding::Unsigned(8),
-            offset: BitFieldOffset::Bit(0),
-        }
-        .add_to(&mut cmd);
-        assert_eq!(args_of(&cmd), vec!["GET", "u8", "0"]);
-
-        let mut cmd = Cmd::new();
-        BitFieldSubcommand::Set {
-            encoding: BitEncoding::Signed(5),
-            offset: BitFieldOffset::Multiplier(1),
-            value: 12,
-        }
-        .add_to(&mut cmd);
-        assert_eq!(args_of(&cmd), vec!["SET", "i5", "#1", "12"]);
-
-        let mut cmd = Cmd::new();
-        BitFieldSubcommand::IncrBy {
-            encoding: BitEncoding::Unsigned(4),
-            offset: BitFieldOffset::Bit(2),
-            increment: -3,
-        }
-        .add_to(&mut cmd);
-        assert_eq!(args_of(&cmd), vec!["INCRBY", "u4", "2", "-3"]);
-
-        let mut cmd = Cmd::new();
-        BitFieldSubcommand::Overflow(BitOverflow::Sat).add_to(&mut cmd);
-        assert_eq!(args_of(&cmd), vec!["OVERFLOW", "SAT"]);
+        assert_args(
+            BitFieldSubcommand::Get {
+                encoding: BitEncoding::Unsigned(8),
+                offset: BitFieldOffset::Bit(0),
+            },
+            &["GET", "u8", "0"],
+        );
+        assert_args(
+            BitFieldSubcommand::Set {
+                encoding: BitEncoding::Signed(5),
+                offset: BitFieldOffset::Multiplier(1),
+                value: 12,
+            },
+            &["SET", "i5", "#1", "12"],
+        );
+        assert_args(
+            BitFieldSubcommand::IncrBy {
+                encoding: BitEncoding::Unsigned(4),
+                offset: BitFieldOffset::Bit(2),
+                increment: -3,
+            },
+            &["INCRBY", "u4", "2", "-3"],
+        );
+        assert_args(
+            BitFieldSubcommand::Overflow(BitOverflow::Sat),
+            &["OVERFLOW", "SAT"],
+        );
     }
 
     #[test]
     fn parse_bitfield_handles_nil() {
-        let v = redis::Value::Array(vec![redis::Value::Int(1), redis::Value::Nil]);
+        let v = ValkeyValue::Array(vec![ValkeyValue::Int(1), ValkeyValue::Nil]);
         assert_eq!(parse_bitfield(v).unwrap(), vec![Some(1), None]);
     }
 }

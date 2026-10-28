@@ -4,10 +4,14 @@ package integTest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,11 +26,13 @@ import (
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-func standaloneConfig() *config.ClientConfiguration {
-	host := "localhost"
-	port := 6379
-	if standaloneHosts != nil && *standaloneHosts != "" {
-		parts := strings.SplitN(*standaloneHosts, ",", 2)
+// firstEndpoint returns the first address in an endpoints flag, or the given fallback when the flag is
+// empty. skipMode skips every pool and scope test when the flag is empty, so the fallback just records
+// the conventional port.
+func firstEndpoint(endpoints *string, fallbackHost string, fallbackPort int) config.NodeAddress {
+	host, port := fallbackHost, fallbackPort
+	if endpoints != nil && *endpoints != "" {
+		parts := strings.SplitN(*endpoints, ",", 2)
 		hostPort := strings.SplitN(parts[0], ":", 2)
 		if len(hostPort) == 2 {
 			host = hostPort[0]
@@ -35,30 +41,18 @@ func standaloneConfig() *config.ClientConfiguration {
 			}
 		}
 	}
-	return config.NewClientConfiguration().
-		WithAddress(&config.NodeAddress{Host: host, Port: port}).
-		WithRequestTimeout(5000 * time.Millisecond)
+	return config.NodeAddress{Host: host, Port: port}
+}
+
+func standaloneConfig() *config.ClientConfiguration {
+	return clientConfigFor(firstEndpoint(standaloneHosts, "localhost", 6379))
 }
 
 // standaloneConfigForClusterNode returns a standalone ClientConfiguration
 // pointed at the first cluster node. This allows using ScopedConnection against
 // a cluster node for single-slot operations with hash-tagged keys.
 func standaloneConfigForClusterNode() *config.ClientConfiguration {
-	host := "localhost"
-	port := 7000
-	if clusterHosts != nil && *clusterHosts != "" {
-		parts := strings.SplitN(*clusterHosts, ",", 2)
-		hostPort := strings.SplitN(parts[0], ":", 2)
-		if len(hostPort) == 2 {
-			host = hostPort[0]
-			if p, err := strconv.Atoi(hostPort[1]); err == nil {
-				port = p
-			}
-		}
-	}
-	return config.NewClientConfiguration().
-		WithAddress(&config.NodeAddress{Host: host, Port: port}).
-		WithRequestTimeout(5000 * time.Millisecond)
+	return clientConfigFor(firstEndpoint(clusterHosts, "localhost", 7000))
 }
 
 func compressedStandaloneConfig() *config.ClientConfiguration {
@@ -78,21 +72,7 @@ func compressedClusterNodeConfig() *config.ClientConfiguration {
 }
 
 func clusterConfig() *config.ClusterClientConfiguration {
-	host := "localhost"
-	port := 7000
-	if clusterHosts != nil && *clusterHosts != "" {
-		parts := strings.SplitN(*clusterHosts, ",", 2)
-		hostPort := strings.SplitN(parts[0], ":", 2)
-		if len(hostPort) == 2 {
-			host = hostPort[0]
-			if p, err := strconv.Atoi(hostPort[1]); err == nil {
-				port = p
-			}
-		}
-	}
-	return config.NewClusterClientConfiguration().
-		WithAddress(&config.NodeAddress{Host: host, Port: port}).
-		WithRequestTimeout(5000 * time.Millisecond)
+	return clusterClientConfigFor(firstEndpoint(clusterHosts, "localhost", 7000))
 }
 
 func clusterAvailable() bool {
@@ -387,6 +367,161 @@ func TestPoolConcurrentAccess(t *testing.T) {
 
 			for err := range errCh {
 				t.Fatalf("concurrent access error: %v", err)
+			}
+		})
+	}
+}
+
+// awaitSignals receives n signals from ch, reporting false if the timeout elapses first.
+func awaitSignals(ch <-chan struct{}, n int, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for i := 0; i < n; i++ {
+		select {
+		case <-ch:
+		case <-deadline:
+			return false
+		}
+	}
+	return true
+}
+
+// A burst of borrows racing warmup must not push the pool past MaxSize. The race is narrow, so two
+// things force it: goroutines park on startGate until the pool exists (no goroutine-spawn latency),
+// and each holds its client through round 0 — should_create() only fires on an empty idle list, so
+// one holder per slot drains idle as fast as warmup fills it. Repeated over fresh pools because the
+// connectivity probe in NewClientPool sometimes closes the window first.
+func TestPoolDoesNotExceedMaxSizeUnderWarmupBurst(t *testing.T) {
+	const (
+		maxSize = 64
+		// One holder per slot: more would deadlock against a pool that holds exactly MaxSize.
+		goroutines = maxSize
+		rounds     = 3
+		attempts   = 12
+	)
+
+	for _, tc := range scopeModes() {
+		t.Run(tc.name, func(t *testing.T) {
+			skipMode(t, tc.cluster)
+
+			for attempt := 0; attempt < attempts; attempt++ {
+				func() {
+					ctx := context.Background()
+					var poolRef atomic.Pointer[glide.ClientPool]
+
+					startGate := make(chan struct{})
+					releaseGate := make(chan struct{})
+					var startOnce, releaseOnce sync.Once
+					openStart := func() { startOnce.Do(func() { close(startGate) }) }
+					openRelease := func() { releaseOnce.Do(func() { close(releaseGate) }) }
+
+					holdingCh := make(chan struct{}, goroutines)
+					doneCh := make(chan struct{}, goroutines)
+					errCh := make(chan error, goroutines)
+
+					for i := 0; i < goroutines; i++ {
+						go func(idx int) {
+							holding := false
+							defer func() {
+								if !holding {
+									// Never reached the hold, so release the barrier anyway.
+									holdingCh <- struct{}{}
+								}
+								doneCh <- struct{}{}
+							}()
+
+							<-startGate
+							pool := poolRef.Load()
+							if pool == nil { // pool creation failed; the test goroutine has already aborted
+								return
+							}
+
+							for round := 0; round < rounds; round++ {
+								clientID, err := pool.Acquire(ctx)
+								if err != nil {
+									errCh <- fmt.Errorf("goroutine %d round %d acquire: %w", idx, round, err)
+									return
+								}
+
+								client, err := pool.GetClient(clientID)
+								if err != nil {
+									pool.Release(clientID)
+									errCh <- fmt.Errorf("goroutine %d round %d get client: %w", idx, round, err)
+									return
+								}
+
+								key := scopeTestKey(fmt.Sprintf("pool-warmup-burst-%d-%d", idx, round), tc.cluster)
+								if _, err = client.Set(ctx, key, fmt.Sprintf("val-%d-%d", idx, round)); err != nil {
+									client.Close()
+									errCh <- fmt.Errorf("goroutine %d round %d set: %w", idx, round, err)
+									return
+								}
+								if _, err = client.Get(ctx, key); err != nil {
+									client.Close()
+									errCh <- fmt.Errorf("goroutine %d round %d get: %w", idx, round, err)
+									return
+								}
+								client.Client.Del(ctx, []string{key})
+
+								if round == 0 {
+									// Keep the slot borrowed until every goroutine holds one, so the
+									// idle list stays empty for the whole warmup window.
+									holding = true
+									holdingCh <- struct{}{}
+									select {
+									case <-releaseGate:
+									case <-time.After(60 * time.Second):
+										client.Close()
+										errCh <- fmt.Errorf("goroutine %d: release gate timed out", idx)
+										return
+									}
+								}
+								client.Close()
+							}
+						}(i)
+					}
+
+					pool := newPool(t, tc.cluster, glide.PoolConfig{
+						MaxSize:        maxSize,
+						MinIdle:        maxSize,
+						AcquireTimeout: 20 * time.Second,
+					})
+					defer pool.Close()
+					defer openRelease()
+					poolRef.Store(pool)
+					openStart()
+
+					require.Truef(t, awaitSignals(holdingCh, goroutines, 90*time.Second),
+						"attempt %d: not every burst goroutine borrowed a slot", attempt)
+					openRelease()
+					require.Truef(t, awaitSignals(doneCh, goroutines, 120*time.Second),
+						"attempt %d: burst goroutines did not finish", attempt)
+
+					close(errCh)
+					for err := range errCh {
+						t.Fatalf("attempt %d: warmup burst error: %v", attempt, err)
+					}
+
+					// Quiesce so the counters are settled, not mid-release: a borrow still in
+					// flight would otherwise leave IdleCount lagging TotalCount. A zero total is
+					// not a settled pool — glide_pool_metrics leaves its out-param untouched when
+					// the pool lock is contended, which Go reports as 0 — so keep polling.
+					var total, idle int
+					deadline := time.Now().Add(15 * time.Second)
+					for time.Now().Before(deadline) {
+						total, idle = pool.TotalCount(), pool.IdleCount()
+						if total > 0 && pool.ActiveCount() == 0 && idle == total {
+							break
+						}
+						time.Sleep(50 * time.Millisecond)
+					}
+
+					require.Positivef(t, total, "attempt %d: pool counters never settled", attempt)
+					require.LessOrEqualf(t, total, maxSize,
+						"attempt %d: pool created more connections than MaxSize: total=%d, MaxSize=%d",
+						attempt, total, maxSize)
+					require.LessOrEqualf(t, idle, maxSize,
+						"attempt %d: idle exceeded MaxSize: idle=%d, MaxSize=%d", attempt, idle, maxSize)
+				}()
 			}
 		})
 	}
@@ -1319,4 +1454,128 @@ func TestPoolBorrowedClientScopedConnection(t *testing.T) {
 
 	// Cleanup
 	client.Client.Del(ctx, []string{key})
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Acquire fails fast
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// The scope pool holds at most this many connections per client (glide-core
+// ScopePoolConfig::default().max_total). Not configurable from Go.
+const scopePoolMaxTotal = 64
+
+func holdWholeScopePool(t *testing.T, client scopeTestClient) []*glide.IsolatedScope {
+	t.Helper()
+	held := make([]*glide.IsolatedScope, 0, scopePoolMaxTotal)
+	for i := 0; i < scopePoolMaxTotal; i++ {
+		scope, err := client.ScopedConnection(context.Background(), 10*time.Second, "")
+		require.NoError(t, err)
+		held = append(held, scope)
+	}
+	return held
+}
+
+// An acquire stops as soon as its outcome is known: the error type names the
+// cause, and a cause that waiting cannot fix is reported without waiting.
+func TestScopeAcquireExhaustedPoolTimesOutNamingTheCause(t *testing.T) {
+	skipMode(t, false)
+	client := newScopeClient(t, false)
+	defer client.Close()
+
+	held := holdWholeScopePool(t, client)
+	defer func() {
+		for _, s := range held {
+			s.Close()
+		}
+	}()
+
+	started := time.Now()
+	_, err := client.ScopedConnection(context.Background(), 500*time.Millisecond, "")
+	elapsed := time.Since(started)
+
+	var timeoutErr *glide.TimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Contains(t, err.Error(), "pool exhausted")
+	assert.GreaterOrEqual(t, elapsed, 400*time.Millisecond)
+	assert.Less(t, elapsed, time.Second)
+}
+
+func TestScopeAcquireEndsWhenClientClosesMidWait(t *testing.T) {
+	skipMode(t, false)
+	client, err := glide.NewClient(standaloneConfig())
+	require.NoError(t, err)
+	holdWholeScopePool(t, client)
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		client.Close()
+	}()
+	started := time.Now()
+	_, err = client.ScopedConnection(context.Background(), 5*time.Second, "")
+	elapsed := time.Since(started)
+
+	var disconnect *glide.DisconnectError
+	require.ErrorAs(t, err, &disconnect)
+	assert.Less(t, elapsed, 2*time.Second, "waited %v past the close for a 5s deadline", elapsed)
+}
+
+func TestScopeAcquireLazyMtlsParentFailsWithoutWaiting(t *testing.T) {
+	// A lazily connected client with TLS material never dials, so there is
+	// nothing for a scoped connection to inherit. Any certificate serves as the
+	// material; read the committed glide-core fixture rather than utils/tls_crts/,
+	// which exists only after a TLS server start.
+	caCert, err := os.ReadFile(filepath.Join("..", "..", "glide-core", "src", "tls_reload", "test_data", "cert_a.pem"))
+	require.NoError(t, err)
+
+	cfg := tlsClientConfigFor(
+		config.NewTlsConfiguration().WithRootCertificates(caCert),
+		config.NodeAddress{Host: "127.0.0.1", Port: 1},
+	).WithLazyConnect(true)
+	client, err := glide.NewClient(cfg)
+	require.NoError(t, err)
+	defer client.Close()
+
+	started := time.Now()
+	_, err = client.ScopedConnection(context.Background(), 5*time.Second, "")
+	elapsed := time.Since(started)
+
+	// Go maps an Unspecified error type to a plain error, so the cause is
+	// visible only in the message; what matters is that it is not a timeout.
+	require.Error(t, err)
+	var timeoutErr *glide.TimeoutError
+	assert.False(t, errors.As(err, &timeoutErr), "a terminal cause must not surface as a timeout")
+	assert.Contains(t, err.Error(), "certificate material")
+	assert.Less(t, elapsed, 2*time.Second)
+}
+
+// A caller that stops waiting must not keep the slot the core later grants it.
+func TestScopeAcquireAbandonedByCallerReturnsItsSlot(t *testing.T) {
+	skipMode(t, false)
+	client := newScopeClient(t, false)
+	defer client.Close()
+
+	held := holdWholeScopePool(t, client)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := client.ScopedConnection(ctx, 5*time.Second, "")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// The abandoned acquire is still waiting in the core; freeing the pool lets
+	// it win a slot, which the binding must then release on its behalf.
+	for _, s := range held {
+		s.Close()
+	}
+
+	refilled := make([]*glide.IsolatedScope, 0, scopePoolMaxTotal)
+	defer func() {
+		for _, s := range refilled {
+			s.Close()
+		}
+	}()
+	for i := 0; i < scopePoolMaxTotal; i++ {
+		scope, err := client.ScopedConnection(context.Background(), 2*time.Second, "")
+		require.NoError(t, err, "slot %d of %d unavailable after an abandoned acquire", i+1, scopePoolMaxTotal)
+		refilled = append(refilled, scope)
+	}
 }

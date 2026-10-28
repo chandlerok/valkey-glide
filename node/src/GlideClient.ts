@@ -88,6 +88,7 @@ import {
     parseLatencyLatestResponse,
     parseMemoryStatsResponse,
 } from "./Commands";
+import { setScopeConnectionRequest } from "./ScopeInternal";
 
 /* eslint-disable-next-line @typescript-eslint/no-namespace */
 export namespace GlideClientConfiguration {
@@ -313,7 +314,7 @@ export class GlideClient extends BaseClient {
      *     numberOfRetries: 5,
      *     factor: 1000,
      *     exponentBase: 2,
-     *     jitter: 20,
+     *     jitterPercent: 20,
      *   },
      *   pubsubSubscriptions: {
      *     channelsAndPatterns: {
@@ -340,6 +341,56 @@ export class GlideClient extends BaseClient {
         return super.createClientInternal<GlideClient>(
             options,
             (options?: GlideClientConfiguration) => new GlideClient(options),
+        );
+    }
+
+    /**
+     * Acquire a pool client by ID and wrap it as a GlideClient.
+     *
+     * Called by {@link ClientPool} after a successful `poolTryAcquire` or
+     * `poolAcquireBlocking`. Spins up a fresh worker thread for the
+     * already-connected pool client and returns a fully operational instance.
+     *
+     * @internal - intended for use by ClientPool only.
+     */
+    public static async fromPoolClientId(
+        clientId: number,
+        options: GlideClientConfiguration,
+        connectionRequestBytes: Uint8Array,
+    ): Promise<GlideClient> {
+        const { poolBuildHandle } = await import("../build-ts/native");
+        // Create the client instance whose handleResponsesAvailable will be stored
+        // as the Rust TSFN wake callback. The same instance must be the one that
+        // receives the handle — arrow functions bind `this` at construction, so
+        // the callback and the client handle MUST live on the same object.
+        const client = new GlideClient(options);
+        const handle = await poolBuildHandle(
+            clientId,
+            (client as unknown as { handleResponsesAvailable: () => void })
+                .handleResponsesAvailable,
+        );
+        // Inject the handle into the SAME instance whose callback was registered.
+        (client as unknown as { clientHandle: typeof handle }).clientHandle =
+            handle;
+        // The client never runs connectToServer, so give it the pool's
+        // connection request for scopedConnection().
+        setScopeConnectionRequest(client, connectionRequestBytes);
+        return client;
+    }
+
+    /**
+     * @internal
+     * Serialise a {@link GlideClientConfiguration} into the protobuf bytes
+     * used by the pool Rust APIs.  Does not open a network connection.
+     */
+    public static serializeConfig(options: GlideClientConfiguration): {
+        bytes: Uint8Array;
+        resolverKey: string | undefined;
+    } {
+        return super.serializeConnectionRequest(
+            options,
+            (opts?: BaseClientConfiguration) =>
+                new GlideClient(opts as GlideClientConfiguration),
         );
     }
 
@@ -710,7 +761,7 @@ export class GlideClient extends BaseClient {
      * Deletes a library and all its functions.
      *
      * @see {@link https://valkey.io/commands/function-delete/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @param libraryCode - The library name to delete.
      * @returns A simple `"OK"` response.
@@ -731,7 +782,7 @@ export class GlideClient extends BaseClient {
      * Loads a library to Valkey.
      *
      * @see {@link https://valkey.io/commands/function-load/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @param libraryCode - The source code that implements the library.
      * @param options - (Optional) Additional parameters:
@@ -761,7 +812,7 @@ export class GlideClient extends BaseClient {
      * Deletes all function libraries.
      *
      * @see {@link https://valkey.io/commands/function-flush/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @param mode - (Optional) The flushing mode, could be either {@link FlushMode.SYNC} or {@link FlushMode.ASYNC}.
      * @returns A simple `"OK"` response.
@@ -782,7 +833,7 @@ export class GlideClient extends BaseClient {
      * Returns information about the functions and libraries.
      *
      * @see {@link https://valkey.io/commands/function-list/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @param options - (Optional) See {@link FunctionListOptions} and {@link DecoderOption}.
      * @returns Info about all or selected libraries and their functions in {@link FunctionListResponse} format.
@@ -826,7 +877,7 @@ export class GlideClient extends BaseClient {
      * The response includes a mapping from node address to the command response for that node.
      *
      * @see {@link https://valkey.io/commands/function-stats/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @param options - (Optional) See {@link DecoderOption}.
      * @returns A Record where the key is the node address and the value is a Record with two keys:
@@ -881,7 +932,7 @@ export class GlideClient extends BaseClient {
      * `FUNCTION KILL` runs on all nodes of the server, including primary and replicas.
      *
      * @see {@link https://valkey.io/commands/function-kill/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @returns `"OK"` if function is terminated. Otherwise, throws an error.
      * @example
@@ -899,7 +950,7 @@ export class GlideClient extends BaseClient {
      * Returns the serialized payload of all loaded libraries.
      *
      * @see {@link https://valkey.io/commands/function-dump/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @returns The serialized payload of all loaded libraries.
      *
@@ -919,7 +970,7 @@ export class GlideClient extends BaseClient {
      * Restores libraries from the serialized payload returned by {@link functionDump}.
      *
      * @see {@link https://valkey.io/commands/function-restore/|valkey.io} for details.
-     * @remarks Since Valkey version 7.0.0.
+     * @since Valkey 7.0.0.
      *
      * @param payload - The serialized data from {@link functionDump}.
      * @param policy - (Optional) A policy for handling existing libraries, see {@link FunctionRestorePolicy}.
@@ -1162,7 +1213,7 @@ export class GlideClient extends BaseClient {
      *
      * @see {@link https://valkey.io/commands/bgsave/|valkey.io} for more details.
      *
-     * @since Valkey 8.1
+     * @since Valkey 8.1.0.
      *
      * @returns A non-empty status string.
      *
