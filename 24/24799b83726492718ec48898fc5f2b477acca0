@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_2e841458567998::t_05f1edcd748bdd 19
+python/glide-sync/setup.py
+  s_2e841458567998::t_3866898522e203 78-80,120-122,135
+python/tests/sync_tests/test_sync_value_parsing.py
+  s_2e841458567998::t_7e58d61cf67019 1-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2424799b83726492718ec48898fc5f2b477acca0",
+  "prompts": {},
+  "sessions": {
+    "s_2e841458567998": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f2fe07-a0a7-414b-945f-47eb8b7a9528",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Chandler King <chandlerok@users.noreply.github.com>"
+    }
+  }
+}
