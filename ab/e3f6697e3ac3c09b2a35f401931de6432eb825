@@ -1,0 +1,37 @@
+python/glide-sync/setup.py
+  s_2e841458567998::t_3866898522e203 78-80,120-122,135
+python/tests/sync_tests/test_sync_value_parsing.py
+  s_2e841458567998::t_7e58d61cf67019 1-56
+CHANGELOG.md
+  s_2e841458567998::t_05f1edcd748bdd 19
+ffi/src/lib.rs
+  s_2e841458567998::t_b8805140188044 563-565,598-600,610-638,2015-2016,2160-2174,2278,2778,5427,5465,5916
+ffi/src/pool_ffi.rs
+  s_2e841458567998::t_4eaf82fe81b600 1180,1292,1315,1323,1336,1352
+python/glide-shared/Cargo.lock
+  s_2e841458567998::t_3372600b355ee0 5-552,557-2073,2077-2078,2080-2087,2090-2091,2093-2098,2101-2102,2104-2108,2111-2112,2114-2119,2122-2123,2125,2127-2132,2136-2137,2139-2163,2165-2223,2225-2227,2231-2232,2234,2236-2238,2242-2243,2245,2247-2248,2252-2253,2255,2257,2260-2261,2265-2266,2268-2318,2322,2326-2327,2329,2332-2333,2337-2338,2340-2469,2473-2474,2478-2479,2481-2484,2487-2488,2490-2567
+python/glide-shared/Cargo.toml
+  s_2e841458567998::t_f59a7b73c80cc0 12
+python/glide-shared/glide_shared/_glide_ffi.py
+  s_2e841458567998::t_5b63c840792be1 112,118-119
+python/glide-shared/src/lib.rs
+  s_2e841458567998::t_6e59fdd9b3cd52 3,77,81,85-90,150,152-208,210-231,233-234,236-252,254-264,268-361,380-386,390-391
+python/glide-sync/glide_sync/glide_client.py
+  s_2e841458567998::t_8b4e1d8c05a86d 13-14,238,305,545-551,555-563
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "abe3f6697e3ac3c09b2a35f401931de6432eb825",
+  "prompts": {},
+  "sessions": {
+    "s_2e841458567998": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0f2fe07-a0a7-414b-945f-47eb8b7a9528",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Chandler King <chandlerok@users.noreply.github.com>"
+    }
+  }
+}
